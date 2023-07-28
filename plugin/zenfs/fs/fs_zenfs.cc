@@ -257,6 +257,29 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
 }
 
 ZenFS::~ZenFS() {
+  // *************zenfs tool df space amplification*************
+  uint64_t used = zbd_->GetUsedSpace();
+  uint64_t free = zbd_->GetFreeSpace();
+  uint64_t reclaimable = zbd_->GetReclaimableSpace();
+
+  /* Avoid divide by zero */
+  if (used == 0) used = 1;
+
+  fprintf(stdout, "*************zenfs tool df space amplification*************\n");
+  fprintf(stdout,
+          "Free: %lu MB\nUsed: %lu MB\nReclaimable: %lu MB\nSpace "
+          "amplification: %lu%%\n",
+          free / (1024 * 1024), used / (1024 * 1024),
+          reclaimable / (1024 * 1024), (100 * reclaimable) / used);
+  fprintf(stdout, "***********************************************************\n");
+  // ***********************************************************
+
+  // *********Garbage collection total_copied_data_size*********
+  fprintf(stdout, "*********Garbage collection total_copied_data_size*********\n");
+  std::cout << "[GCFinal Copied Data] : " << total_copied_data_size << "\n";
+  fprintf(stdout, "***********************************************************\n");
+  // ***********************************************************
+
   Status s;
   Info(logger_, "ZenFS shutting down");
   zbd_->LogZoneUsage();
