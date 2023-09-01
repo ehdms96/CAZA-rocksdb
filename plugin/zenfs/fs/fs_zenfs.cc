@@ -1031,7 +1031,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     }
 
     zoneFile =
-        std::make_shared<ZoneFile>(zbd_, next_file_id_++, &metadata_writer_);
+        std::make_shared<ZoneFile>(zbd_, fname, next_file_id_++, &metadata_writer_);
     zoneFile->SetFileModificationTime(time(0));
     zoneFile->AddLinkName(fname);
 
@@ -1349,7 +1349,7 @@ void ZenFS::EncodeJson(std::ostream& json_stream) {
 }
 
 Status ZenFS::DecodeFileUpdateFrom(Slice* slice, bool replace) {
-  std::shared_ptr<ZoneFile> update(new ZoneFile(zbd_, 0, &metadata_writer_));
+  std::shared_ptr<ZoneFile> update(new ZoneFile(zbd_, "not_set", 0, &metadata_writer_));
   uint64_t id;
   Status s;
 
@@ -1396,7 +1396,7 @@ Status ZenFS::DecodeSnapshotFrom(Slice* input) {
 
   while (GetLengthPrefixedSlice(input, &slice)) {
     std::shared_ptr<ZoneFile> zoneFile(
-        new ZoneFile(zbd_, 0, &metadata_writer_));
+        new ZoneFile(zbd_, "not_set", 0, &metadata_writer_));
     Status s = zoneFile->DecodeFrom(&slice);
     if (!s.ok()) return s;
 
@@ -2000,8 +2000,7 @@ IOStatus ZenFS::MigrateFileExtents(
     Zone* target_zone = nullptr;
 
     // Allocate a new migration zone.
-    s = zbd_->TakeMigrateZone(&target_zone, zfile->GetWriteLifeTimeHint(),
-                              ext->length_);
+    s = zbd_->TakeMigrateZone(&target_zone, zfile->GetWriteLifeTimeHint(), ext->length_, zfile.get());
     if (!s.ok()) {
       continue;
     }

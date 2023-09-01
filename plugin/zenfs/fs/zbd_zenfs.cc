@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 #include <semaphore>
+#include <iostream>
 
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -64,6 +65,7 @@ Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
+  zone_id_ = idx;
   if (zbd_be->ZoneIsWritable(zones, idx))
     capacity_ = max_capacity_ - (wp_ - start_);
 }
@@ -189,34 +191,13 @@ ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
 
   /* 
      @ type 1 : default zenFS
-     @ type 2 : lifetime-hint based (reducing WAF)
-     @ type 3 : lock avoidance
-     @ type 4 : dynamic zone allocation (our goal)
-     @ type 5 : static zone allocation
+     @ type 2 : CAZA
      
   */
-  zone_alloc_mode = 4; 
+  zone_alloc_mode = 2; 
   
   logging_mode = false;
   env_ = Env::Default();
-
-  if (true && zone_alloc_mode==5) { // zone settings for SZA
-  // static zone allocation 
-    n_fixed_zones_[0] = 2;
-    n_fixed_zones_[2] = 1;
-    n_fixed_zones_[3] = 2; 
-    n_fixed_zones_[4] = 2;
-    n_fixed_zones_[5] = 5;
-  }
-
-  if (true && zone_alloc_mode==4) { //default zone settings for DZA
-    n_fixed_zones_[0] = 2; // Metadata - Lifetime 0
-                           // None     - Lifetime 1
-    n_fixed_zones_[2] = 1; // WAL      - Lifetime 2
-    n_fixed_zones_[3] = 3; // Short    - Lifetime 3
-    n_fixed_zones_[4] = 3; // Long     - Lifetime 4
-    n_fixed_zones_[5] = 3; // Extreme  - Lifetime 5
-  }
 
 }
 
@@ -754,6 +735,107 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
   return IOStatus::OK();
 }
 
+IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime, Zone **zone_out, 
+                                            InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity){
+  fprintf(stdout, "GetBestCAZAMatch\n");
+  Zone *allocated_zone = nullptr;
+  IOStatus s;
+
+  std::cout << "file_lifetime : " << file_lifetime << " smallest : " << smallest.size() << " largest : " << largest.size() << " level : " << level << std::endl;
+  
+  assert(sst_to_zone_.empty());
+  fprintf(stdout, "sst_to_zone is not empty!\t sst_to_zone : ");
+  for(auto iter = sst_to_zone_.begin() ; iter != sst_to_zone_.end(); iter++){
+		std::cout << iter->first << " " ;
+	}
+  std::cout << std::endl; 
+
+  // There's valid SSTables in Zones
+  // Find zone where the files located at adjacent level and having overlapping keys
+  std::vector<uint64_t> fno_list;
+  std::vector<Zone*> candidates;
+  AdjacentFileList(smallest, largest, level, fno_list);
+
+  if (!fno_list.empty()) {
+    /* There are SSTables with overlapped keys and adjacent level.
+        (1) Find the Zone where the SSTables are written */
+
+    std::set<int> zone_list;
+    // sst_zone_mtx_.lock();
+    for (uint64_t fno : fno_list) {
+      auto z = sst_to_zone_.find(fno);
+      if (z != sst_to_zone_.end()) {
+        for (int zone_id : z->second) {
+          zone_list.insert(zone_id);
+        }
+      }
+    }
+    // sst_zone_mtx_.unlock(); 
+
+    // (2) Pick the Zones with free space as candidates
+    for (const auto z : io_zones) {
+      auto search = zone_list.find(z->zone_id_);
+      if (search != zone_list.end()){
+        if (!z->IsFull() && !z->IsBusy()) {
+          candidates.push_back(z);
+        }
+      }
+    }
+
+    if (!candidates.empty()) {
+      /* There is at least one zone having free space */
+      // If there's more than one zone, pick the zone with most data with overlapped SST
+      uint64_t overlapped_data = 0;
+      uint64_t alloc_inval_data = 0;
+      for (const auto z : candidates) {
+        uint64_t data_amount = 0;
+        uint64_t inval_data = 0;
+        for (const auto ext : z->extent_info_) {
+          if (!ext->valid_) {
+            inval_data += ext->length_;
+          } else if (ext->valid_ && ext->zone_file_->is_sst_) {
+            uint64_t cur_fno = ext->zone_file_->fno_;
+            for (uint64_t fno : fno_list) {
+                if (cur_fno == fno ) {
+                  data_amount += ext->length_; 
+                }
+            }
+          }
+          if (data_amount > overlapped_data && !z->IsBusy() && z->capacity_ >= min_capacity) {
+            allocated_zone = z;
+            alloc_inval_data = inval_data;
+          } 
+          else if ((data_amount == overlapped_data) && (alloc_inval_data > inval_data) && !z->IsBusy() && z->capacity_ >= min_capacity) {
+            allocated_zone = z;
+            alloc_inval_data = inval_data;
+          }
+        }
+      }
+    }
+  } // if (!fno_list.empty())
+  else if (fno_list.empty() && (level==0 || level==100 )) {
+    /* (1) There is no matching files being overlapped with current file
+      ->(TODO)Find the file within the same level which has smallest key diff*/
+    
+    std::set<int> zone_list;
+  }
+  else{
+    // SameLevelFileList(level, fno_list);
+    // allocated_zone = AllocateZoneWithSameLevelFiles(fno_list, smallest, largest);
+  }
+
+  *zone_out = allocated_zone;
+  
+  return IOStatus::OK();
+} 
+
+void ZonedBlockDevice::AdjacentFileList(const InternalKey& s, const InternalKey& l, const int level, std::vector<uint64_t>& fno_list){
+    if(level == 100) return;
+
+    std::cout << " smallest : " << s.size() << " largest : " << l.size() << " level : " << level << "fno_list size : " << fno_list.size() << std::endl;
+    //db_ptr_->AdjacentFileList(s, l, level, fno_list);
+}
+
 std::string time_in_HH_MM_SS_MMM()
 {
     using namespace std::chrono;
@@ -778,318 +860,6 @@ std::string time_in_HH_MM_SS_MMM()
 
     return oss.str();
 }
-
-IOStatus ZonedBlockDevice::LockLevelMutex(Env::WriteLifeTimeHint file_lifetime) {
-
- /* if (file_lifetime > 2) {
-    if (file_lifetime ==3) {
-      medium_accumulated_ -= env_->NowMicros();
-    } else if (file_lifetime == 4) {
-      long_accumulated_ -= env_->NowMicros();
-    } else if (file_lifetime == 5) {
-      extreme_accumulated_ -= env_->NowMicros();
-    }
-  }
-  */
-  if (true && false) { // for tracing concurrent write files
-      if (file_lifetime == 2){
-        short_cnt_++;
-      } else if (file_lifetime == 3){ 
-        medium_cnt_++;
-      } else if (file_lifetime == 4) {
-        long_cnt_++;
-      } else if (file_lifetime == 5) {
-        extreme_cnt_++;
-      }
-      std::cout << time_in_HH_MM_SS_MMM() << "  SHORT:" << short_cnt_ << ", MEDIUM:" << medium_cnt_ << ", LONG:" << long_cnt_ << ", EXTREME:" << extreme_cnt_ << "\n";
-  }
-
-
-  if (zone_alloc_mode==2 && file_lifetime > 2) {//lifetime-based
-    if (logging_mode) {
-      if (file_lifetime == 3){ 
-        medium_cnt_++;
-      } else if (file_lifetime == 4) {
-        long_cnt_++;
-      } else if (file_lifetime == 5) {
-        extreme_cnt_++;
-      }
-      std::cout << time_in_HH_MM_SS_MMM() << "  MEDIUM:" << medium_cnt_ << ", LONG:" << long_cnt_ << ", EXTREME:" << extreme_cnt_ << "\n";
-    }
-
-    level_mtx_[file_lifetime].lock();
-    //std::cout << "level #" << file_lifetime << " locked\n";
-  }
-
-
-  return IOStatus::OK();
-}
-
-IOStatus ZonedBlockDevice::UnLockLevelMutex(Env::WriteLifeTimeHint file_lifetime) {
-
-
-  if (true) { // for tracing concurrent write files
-      if (file_lifetime == 2){
-        short_cnt_--;
-      } else if (file_lifetime == 3){ 
-        medium_cnt_--;
-      } else if (file_lifetime == 4) {
-        long_cnt_--;
-      } else if (file_lifetime == 5) {
-        extreme_cnt_--;
-      }
-      //std::cout << time_in_HH_MM_SS_MMM() << "  SHORT:" << short_cnt_ << ", MEDIUM:" << medium_cnt_ << ", LONG:" << long_cnt_ << ", EXTREME:" << extreme_cnt_ << "\n";
-  }
-  
-  /*if (file_lifetime > 2) {
-    if (file_lifetime ==3) {
-      medium_accumulated_ += env_->NowMicros();
-    } else if (file_lifetime == 4) {
-      long_accumulated_ += env_->NowMicros();
-    } else if (file_lifetime == 5) {
-      extreme_accumulated_ += env_->NowMicros();
-    }
-    std::cout << time_in_HH_MM_SS_MMM() << "  MEDIUM:" << medium_accumulated_ << ", LONG:" << long_accumulated_ << ", EXTREME:" << extreme_accumulated_ << "\n";
-  }*/
-
-  if (zone_alloc_mode==2 && file_lifetime > 2) {
-    if (logging_mode) { 
-      if (file_lifetime == 3){ 
-        medium_cnt_--;
-      } else if (file_lifetime == 4) {
-        long_cnt_--;
-      } else if (file_lifetime == 5) {
-        extreme_cnt_--;
-      }
-    }
-    level_mtx_[file_lifetime].unlock();
-    //std::cout << "level #" << file_lifetime << " unlocked\n";
-  }
-    
-  return IOStatus::OK();
-}
-
-
-IOStatus ZonedBlockDevice::GetBestWALZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity) {
-
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-
-  for (const auto z : io_zones) {
-    if ((z->used_capacity_ > 0) && !z->IsFull() && z->capacity_ >= min_capacity) {
-      if (z->lifetime_ == file_lifetime) {
-        if (!z->Acquire()) continue; //If used
-        
-        allocated_zone = z;
-        best_diff = 0;
-        break;
-
-      }
-    }
-  }
-
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;
-
-  return IOStatus::OK();
-}
-
-IOStatus ZonedBlockDevice::GetBestDataZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-
-  for (const auto z : io_zones) {
-    if ((z->used_capacity_ > 0) && !z->IsFull() && z->capacity_ >= min_capacity) {
-      if (z->lifetime_ == file_lifetime) {
-        if (!z->Acquire()) continue; //If used
-        
-        allocated_zone = z;
-        best_diff = 0;
-        break;
-
-      }
-    }
-  }
-
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;  
-
-  return IOStatus::OK();
-
-}
-
-IOStatus ZonedBlockDevice::GetSameOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-
-  for (const auto z : io_zones) {
-
-    if ((z->used_capacity_ > 0) && !z->IsFull() && z->capacity_ >= min_capacity) {
-      //unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
-      if(z->lifetime_ == file_lifetime) {
-
-        if(file_lifetime == Env::WriteLifeTimeHint(2)) {
-          if (!z->Acquire()) {
-            continue;
-          }
-        }
-
-        allocated_zone = z;
-        best_diff = 0;
-        break;
-      }
-    }
-  }
-  
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;
-
-  return IOStatus::OK();
-}
-
-IOStatus ZonedBlockDevice::GetFixedOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-  int n_fixed_zones = 0; // the number of fixed zone
-  int n_skip_zones = 0;
-  n_fixed_zones = n_fixed_zones_[file_lifetime];
-
-  std::cout << "GetFixedZone\n";
-
-  while (true) {
-    n_skip_zones = 0;
-    for (const auto z : io_zones) {
-      
-      if(z->lifetime_ == file_lifetime && !z->IsFull() && z->capacity_ >= min_capacity) {
-        if (z->Acquire()) {
-          if (z->GetCapacityLeft() <  (z->max_capacity_*0.1)) {
-            z->Finish();
-            z->CheckRelease();
-            PutActiveIOZoneToken();
-            continue;
-          } else {
-            allocated_zone = z;
-            best_diff = 0;
-            break;
-          }
-        } else { 
-          n_skip_zones++;
-          if (n_skip_zones == n_fixed_zones) {
-            break;
-          }
-        }        
-      }
-    }
-
-
-    if (n_skip_zones < n_fixed_zones) {
-      break;
-    }
-  }
-
-  
-  
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;
-
-  return IOStatus::OK();
-}
-
-IOStatus ZonedBlockDevice::GetDynamicOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-  int n_fixed_zones = 0; // the number of fixed zone
-  int n_skip_zones = 0;
-  n_fixed_zones = n_fixed_zones_[file_lifetime];
-
-  if (true&&false) { // debugging only
-    int used_m = 0;
-    int used_l = 0;
-    int used_e = 0;
-
-    for (const auto z : io_zones) {
-      if (!z->IsFull()) {
-        if (z->lifetime_ == 3) {
-          used_m++;
-        } else if (z->lifetime_ == 4) {
-          used_l++;
-        } else if (z->lifetime_ == 5) {
-          used_e++;
-        }
-      }
-    }
-    std::cout << "[debug] used_zone: " << used_m <<"," << used_l << "," << used_e << "\n";
-  }
-
-  while (true) {
-    n_skip_zones = 0;
-    for (const auto z : io_zones) {
-      
-      if(z->lifetime_ == file_lifetime && !z->IsFull() && z->capacity_ >= min_capacity) {
-        if (z->Acquire()) {
-          if (z->GetCapacityLeft() <  (z->max_capacity_*0.1)) {
-            z->Finish();
-            z->CheckRelease();
-            PutActiveIOZoneToken();
-            continue;
-          } else {
-            allocated_zone = z;
-            best_diff = 0;
-            break;
-          }
-        } else { 
-          n_skip_zones++;
-          if (n_skip_zones == n_fixed_zones) {
-            break;
-          }
-        }        
-      }
-    }
-
-
-    if (n_skip_zones < n_fixed_zones) {
-      break;
-    }
-  }
-
-  
-  
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;
-
-  return IOStatus::OK();
-}
-
-IOStatus ZonedBlockDevice::GetAnyOpenZone(
-    Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out,
-    Zone **zone_out, uint32_t min_capacity) {
-  unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
-  Zone *allocated_zone = nullptr;
-  IOStatus s;
-  for (const auto z : io_zones) {
-    if (z->Acquire()) { // if not busy 
-      if ((z->used_capacity_ > 0) && !z->IsFull() && z->capacity_ >= min_capacity && file_lifetime) {
-          allocated_zone = z; // allocate new zone
-          break;
-      } else {
-          s = z->CheckRelease();
-          if (!s.ok()) return s;
-      }
-
-    }
-  }
-  
-  *best_diff_out = best_diff;
-  *zone_out = allocated_zone;
-
-  return IOStatus::OK();
-}
-
 
 IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   IOStatus s;
@@ -1146,7 +916,7 @@ IOStatus ZonedBlockDevice::ReleaseMigrateZone(Zone *zone) {
   return s;
 }
 
-IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint file_lifetime, uint32_t min_capacity) {
+IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint file_lifetime, uint32_t min_capacity, ZoneFile* zoneFile) {
   std::unique_lock<std::mutex> lock(migrate_zone_mtx_);
   migrate_resource_.wait(lock, [this] { return !migrating_; });
 
@@ -1157,19 +927,8 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHi
   if (zone_alloc_mode == 1) {
     s = GetBestOpenZoneMatch(file_lifetime, &best_diff, out_zone, min_capacity);
     
-  } else if (zone_alloc_mode == 5) {
-    level_mtx_[file_lifetime].lock();
-    s = GetFixedOpenZone(file_lifetime, &best_diff, out_zone, min_capacity);
-    level_mtx_[file_lifetime].unlock();
-  } else if (zone_alloc_mode == 4) {
-    level_mtx_[file_lifetime].lock();
-    s = GetDynamicOpenZone(file_lifetime, &best_diff, out_zone, min_capacity);
-    level_mtx_[file_lifetime].unlock();
-    
-  } else if (zone_alloc_mode == 3) {
-    s = GetAnyOpenZone(file_lifetime, &best_diff, out_zone, min_capacity);
   } else if (zone_alloc_mode == 2) {
-    s = GetSameOpenZone(file_lifetime, &best_diff, out_zone, min_capacity);
+    s = GetBestCAZAMatch(file_lifetime, out_zone, zoneFile->smallest_, zoneFile->largest_, zoneFile->level_, min_capacity);
   }
 
   if (s.ok() && (*out_zone) != nullptr) {
@@ -1178,16 +937,16 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHi
     migrating_ = false;
   }
 
-
   return s;
 }
 
-IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type, Zone **out_zone) {
+IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type, Zone **out_zone, ZoneFile* zoneFile) {
   Zone *allocated_zone = nullptr;
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
   int new_zone = 0;
   IOStatus s;
 
+{
   auto tag = ZENFS_WAL_IO_ALLOC_LATENCY;
   if (io_type != IOType::kWAL) {
     // L0 flushes have lifetime MEDIUM
@@ -1200,10 +959,6 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
 
   ZenFSMetricsLatencyGuard guard(metrics_, tag, Env::Default());
   metrics_->ReportQPS(ZENFS_IO_ALLOC_QPS, 1);
-
-  if (zone_alloc_mode>=4){ 
-    level_mtx_[file_lifetime].lock();
-  }
 
   // Check if a deferred IO error was set
   s = GetZoneDeferredStatus();
@@ -1220,14 +975,11 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
   }
 
   WaitForOpenIOZoneToken(io_type == IOType::kWAL); // Waiting for new token (max open zones limit)
+}
 
   /* 
      @ type 1 : default zenFS
-     @ type 2 : lifetime-hint based (reducing WAF)
-     @ type 3 : lock avoidance
-     @ type 4 : dynamic zone allocation (our goal)
-     @ type 5 : static zone allocation
-     
+     @ type 2 : CAZA
   */
 
   if (zone_alloc_mode == 1) { 
@@ -1291,132 +1043,68 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
         }
       }
     } 
-  } else if (zone_alloc_mode == 2) { // mode = 2 (lifetime-hint)
-    
-    s = GetSameOpenZone(file_lifetime, &best_diff, &allocated_zone);
-    if(!s.ok()) {
-      PutOpenIOZoneToken();
-      return s;
-    }
+  } 
+  else if (zone_alloc_mode == 2) { // mode = 2 (CAZA)
 
-    if (allocated_zone == nullptr) { // allocate empty zone 
-      GetActiveIOZoneTokenIfAvailable();
-      s = AllocateEmptyZone(&allocated_zone);
-      allocated_zone->lifetime_ = file_lifetime;
-    }     
-        
+    if(sst_to_zone_.empty()){
+      fprintf(stdout, "sst_to_zone is empty! ");
+      if(GetActiveIOZoneTokenIfAvailable()){
+        fprintf(stdout, "Alloc Empty Zone --> ");
+        s = AllocateEmptyZone(&allocated_zone);
+        if (!s.ok()) {
+          PutActiveIOZoneToken();
+          PutOpenIOZoneToken();
+          return s;
+        }
 
-  } else if (zone_alloc_mode == 3) { // mode = 3
-    
-    /* Try to fill an already open zone(with the best life time diff) */
-    s = GetAnyOpenZone(file_lifetime, &best_diff, &allocated_zone);
-    if (!s.ok()) {
-      PutOpenIOZoneToken(); //Giving it up 
-      return s;
-    }
-
-    //bool got_token = GetActiveIOZoneTokenIfAvailable();
-
-    /* If we haven't found an open zone to fill, open a new zone */
-    if (allocated_zone == nullptr) {
-      /* We have to make sure we can open an empty zone */
-      GetActiveIOZoneTokenIfAvailable();
-      s = AllocateEmptyZone(&allocated_zone);
-      if (!s.ok()) {
-        PutActiveIOZoneToken();
-        PutOpenIOZoneToken();
-        return s;
+        if (allocated_zone != nullptr) {
+          assert(allocated_zone->IsBusy());
+          allocated_zone->lifetime_ = file_lifetime;
+          new_zone = true;
+        } else {
+          PutActiveIOZoneToken();
+        }
       }
-      allocated_zone->lifetime_ = file_lifetime;
-    }
-  } else if (zone_alloc_mode == 4) { // dynamic mode for using DZA
-
-
-    uint64_t begin = env_->NowMicros();
-
-    //level_mtx_[file_lifetime].lock();
-
-    s = GetDynamicOpenZone(file_lifetime, &best_diff, &allocated_zone);
-    if(!s.ok()) {
-      PutOpenIOZoneToken();
-      return s;
-    }
-
-    if (allocated_zone == nullptr) { // allocate empty zone 
-      GetActiveIOZoneTokenIfAvailable();
-      s = AllocateEmptyZone(&allocated_zone);
-      allocated_zone->lifetime_ = file_lifetime;
-    }
-
-    uint64_t end = env_->NowMicros();
-    uint64_t elapsed_micros = end - begin;
-
-
-    if (file_lifetime == 2) {
-      short_accumulated_+= elapsed_micros;
-    } else if (file_lifetime == 3) {
-      medium_accumulated_+= elapsed_micros;
-    } else if (file_lifetime == 4) {
-      long_accumulated_+= elapsed_micros;
-    } else {
-      extreme_accumulated_+= elapsed_micros;
-    }
-
-
-    //level_mtx_[file_lifetime].unlock();
-
-   /* 
-   if (file_lifetime!=2 && medium_accumulated_ && long_accumulated_ && extreme_accumulated_) {
-      std::cout << "[Blocking Stats] " << "" << (double)medium_accumulated_/(double)total_blocking_time_ << "," \
-      << (double)long_accumulated_/(double)total_blocking_time_ << "," << (double)extreme_accumulated_/(double)total_blocking_time_ << "\n";
-    }
-   */
-
-
-  } else if (zone_alloc_mode == 5) { // static zone allocation
-    
-    //level_mtx_[file_lifetime].lock();
-
-    s = GetFixedOpenZone(file_lifetime, &best_diff, &allocated_zone);
-    if(!s.ok()) {
-      PutOpenIOZoneToken();
-      return s;
-    }
-
-    if (allocated_zone == nullptr) { // allocate empty zone 
-      GetActiveIOZoneTokenIfAvailable();
-      s = AllocateEmptyZone(&allocated_zone);
-      allocated_zone->lifetime_ = file_lifetime;
-    }
-
-    //level_mtx_[file_lifetime].unlock();     
-
-  } else { // what the hell
-
-    if (io_type == IOType::kWAL) {  //Write Ahead Log (WAL) files
-
-      s = GetBestWALZone(file_lifetime, &best_diff, &allocated_zone);
-      if(!s.ok()) {
-        PutOpenIOZoneToken();
-        return s;
-      }
-
-    } else { // SST files 
-
-      s = GetBestDataZone(file_lifetime, &best_diff, &allocated_zone);
+    } else{
+      fprintf(stdout, "Alloc GetBestCAZAMatch --> ");
+      s = GetBestCAZAMatch(file_lifetime, &allocated_zone, zoneFile->smallest_, zoneFile->largest_, zoneFile->level_);
       if(!s.ok()) {
         PutOpenIOZoneToken();
         return s;
       }
     }
 
-    if (allocated_zone == nullptr) { 
-      GetActiveIOZoneTokenIfAvailable();
-      s = AllocateEmptyZone(&allocated_zone);
-      allocated_zone->lifetime_ = file_lifetime;
+    if(allocated_zone != nullptr){
+      fprintf(stdout, "zone alloc id : %d\n", allocated_zone->zone_id_);
+    }
+    else {
+      if(GetActiveIOZoneTokenIfAvailable()){
+        fprintf(stdout, "Get alloc Empty Zone!\n");
+        s = AllocateEmptyZone(&allocated_zone);
+        if (!s.ok()) {
+          PutActiveIOZoneToken();
+          PutOpenIOZoneToken();
+          return s;
+        }
+        if (allocated_zone != nullptr) {
+          assert(allocated_zone->IsBusy());
+          allocated_zone->lifetime_ = file_lifetime;
+          new_zone = true;
+        } else {
+          PutActiveIOZoneToken();
+        }
+      }
+      else{
+        fprintf(stdout, "Try to fill an already open zone!\n");
+        s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone);
+        if (!s.ok()) {
+          PutOpenIOZoneToken(); //Giving it up 
+          return s;
+        }
+      }
+      fprintf(stdout, "zone alloc id : %d\n", allocated_zone->zone_id_);
     }
   }
-
 
   if (allocated_zone) {
     assert(allocated_zone->IsBusy());
@@ -1432,46 +1120,10 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
     LogZoneStats();
   }
 
-  if (zone_alloc_mode>=4){ 
-    level_mtx_[file_lifetime].unlock();
-  }
-
   *out_zone = allocated_zone;
-  auto now_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-
-  if (false || (!logging_mode && false)) { // 5 -> debugging mode
-      std::cout << "[" << std::this_thread::get_id() << "]" << " file_liftime: " << \
-  file_lifetime << ", zone_lifetime: " << allocated_zone->lifetime_ << ", zone_nr: " << allocated_zone->GetZoneNr() << ", active_io_zone: " << \
-  active_io_zones_ << ", open_io_zone: " << open_io_zones_ <<  "  " << std::ctime(&now_time) << "\n"; 
-
-  }
-
-  if(true && false){ //hit-ratio 
-    int n_io_zones = 0;
-    int n_zones_each[6] = {0};
-    for (const auto z : io_zones) {
-      if (z->IsUsed() && !z->IsFull()) {
-        n_io_zones++;
-        n_zones_each[z->lifetime_]++;
-      }
-    }
-
-    if(false) {
-      std::cout << (env_->NowMicros()) << " [" << std::this_thread::get_id() << "]" << " file_liftime: " << \
-      file_lifetime << ", zone_lifetime: " << allocated_zone->lifetime_ << \
-      ", allocated zone: " << allocated_zone->GetZoneNr() << \
-      ", # used zones: " << n_io_zones << "(" << n_zones_each[0] << "," << n_zones_each[1] << "," << n_zones_each[2] << \
-      "," << n_zones_each[3] << "," << n_zones_each[4] << "," << n_zones_each[5] << ")\n";
-    }
-
-
-  }
-
 
   metrics_->ReportGeneral(ZENFS_OPEN_ZONES_COUNT, open_io_zones_);
   metrics_->ReportGeneral(ZENFS_ACTIVE_ZONES_COUNT, active_io_zones_);
-  
-
 
   return IOStatus::OK();
 }

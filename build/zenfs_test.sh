@@ -12,10 +12,9 @@ fi
 echo ""
 echo "Init filesystem (ZenFS)"
 
-rm -r /data2/zns/zenfs_aux01
-
+rm -r /data/doeun/zns_aux/01
 #../plugin/zenfs/util/zenfs mkfs --zbd=/nvme3n2 --aux_path=/data2/zns/zenfs_aux01 --force
-../plugin/zenfs/util/zenfs mkfs --zbd=/nvme3n2 --aux_path=/data2/zns/zenfs_aux01 --enable_gc=true --force
+../plugin/zenfs/util/zenfs mkfs --zbd=/nvme3n2 --aux_path=/data/doeun/zns_aux/01 --enable_gc=true --force
 
 echo "Complete!"
 

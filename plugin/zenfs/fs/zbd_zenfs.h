@@ -23,6 +23,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <queue> // CZ
+#include <functional> // CZ
+#include <map> // CZ
+#include <chrono> // CZ
+
+#include <iostream> // CZ
+#include "db/db_impl/db_impl.h" // CZ
+#include "db/version_edit.h" // CZ
 
 #include "metrics.h"
 #include "rocksdb/env.h"
@@ -31,10 +39,51 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class ZenFS; // CZ
+class DBImpl; // CZ
+class Zone; // CZ
+class ZoneFile; // CZ
+class ZoneExtent; // CZ
+
 class ZonedBlockDevice;
 class ZonedBlockDeviceBackend;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
+
+//(ZC)::class and struct added for Zone Cleaning 
+struct ZoneExtentInfo {
+
+  ZoneExtent* extent_;
+  ZoneFile* zone_file_;
+  bool valid_;
+  uint32_t length_;
+  uint64_t start_;
+  Zone* zone_;
+  std::string fname_;
+  Env::WriteLifeTimeHint lt_;
+  int level_;
+
+  explicit ZoneExtentInfo(ZoneExtent* extent, ZoneFile* zone_file, bool valid, 
+                          uint64_t length, uint64_t start, Zone* zone, std::string fname, 
+                          Env::WriteLifeTimeHint lt, int level)
+      : extent_(extent),
+        zone_file_(zone_file), 
+        valid_(valid), 
+        length_(length), 
+        start_(start), 
+        zone_(zone), 
+        fname_(fname), 
+        lt_(lt),
+        level_(level){ };
+  
+  void invalidate() {
+    assert(extent_ != nullptr);
+    if (!valid_) {
+      fprintf(stderr, "Try to invalidate invalid extent!\n");
+    }       
+    valid_ = false;
+  };
+};
 
 class ZoneList {
  private:
@@ -74,6 +123,14 @@ class Zone {
   bool IsEmpty();
   uint64_t GetZoneNr();
   uint64_t GetCapacityLeft();
+  
+  std::vector<ZoneExtentInfo *> extent_info_; //CZ
+  int zone_id_; //CZ
+
+  void PushExtentInfo(ZoneExtentInfo* extent_info) { 
+    extent_info_.push_back(extent_info);
+  };
+
   bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
   bool Acquire() {
     bool expected = false;
@@ -190,7 +247,9 @@ class ZonedBlockDevice {
                       const std::vector<Zone *> zones);
 
  public:
-
+  std::map<uint64_t, std::vector<int>> sst_to_zone_;
+  std::map<int, Zone*> id_to_zone_;
+  std::mutex sst_zone_mtx_;
 
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
@@ -200,13 +259,9 @@ class ZonedBlockDevice {
 
   IOStatus Open(bool readonly, bool exclusive);
 
-  IOStatus LockLevelMutex(Env::WriteLifeTimeHint file_lifetime);
-  IOStatus UnLockLevelMutex(Env::WriteLifeTimeHint file_lifetime);
-
   Zone *GetIOZone(uint64_t offset);
 
-  IOStatus AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type,
-                          Zone **out_zone);
+  IOStatus AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type, Zone **out_zone, ZoneFile* zoneFile);
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
 
   uint64_t GetFreeSpace();
@@ -248,7 +303,7 @@ class ZonedBlockDevice {
   IOStatus ReleaseMigrateZone(Zone *zone);
 
   IOStatus TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint lifetime,
-                           uint32_t min_capacity);
+                           uint32_t min_capacity, ZoneFile* zoneFile);
 
   void AddBytesWritten(uint64_t written) { bytes_written_ += written; };
   void AddGCBytesWritten(uint64_t written) { gc_bytes_written_ += written; };
@@ -264,12 +319,11 @@ class ZonedBlockDevice {
   IOStatus ApplyFinishThreshold();
   IOStatus FinishCheapestIOZone();
   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetAnyOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetSameOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetFixedOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetDynamicOpenZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetBestWALZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
-  IOStatus GetBestDataZone(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
+  
+  IOStatus GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime, Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0); 
+  void AdjacentFileList(const InternalKey&, const InternalKey&, const int, std::vector<uint64_t>&);
+  
+  
   IOStatus AllocateEmptyZone(Zone **zone_out);
 };
 

@@ -69,6 +69,9 @@ void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
   PutFixed32(output, kFileID);
   PutFixed64(output, file_id_);
 
+  PutFixed32(output, kFileNameDeprecated);
+  PutLengthPrefixedSlice(output, Slice(filename_));
+
   PutFixed32(output, kFileSize);
   PutFixed64(output, file_size_);
 
@@ -145,6 +148,13 @@ Status ZoneFile::DecodeFrom(Slice* input) {
     if (!GetFixed32(input, &tag)) break;
 
     switch (tag) {
+      case kFileNameDeprecated:
+        if (!GetLengthPrefixedSlice(input, &slice))
+          return Status::Corruption("ZoneFile", "Filename missing");
+        filename_ = slice.ToString();
+        if (filename_.length() == 0)
+          return Status::Corruption("ZoneFile", "Zero length filename");
+        break;
       case kFileSize:
         if (!GetFixed64(input, &file_size_))
           return Status::Corruption("ZoneFile", "Missing file size");
@@ -168,6 +178,8 @@ Status ZoneFile::DecodeFrom(Slice* input) {
           return Status::Corruption("ZoneFile", "Invalid zone extent");
         extent->zone_->used_capacity_ += extent->length_;
         extents_.push_back(extent);
+        fprintf(stderr, "Push Extent info in ZoneFile::DecodeFrom\n");
+        extent->zone_->PushExtentInfo(new ZoneExtentInfo(extent, this, true, extent->length_,extent->start_, extent->zone_, filename_, this->lifetime_, this->level_));
         break;
       case kModificationTime:
         uint64_t ct;
@@ -219,7 +231,12 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
     ZoneExtent* extent = update_extents[i];
     Zone* zone = extent->zone_;
     zone->used_capacity_ += extent->length_;
-    extents_.push_back(new ZoneExtent(extent->start_, extent->length_, zone));
+    ZoneExtent* new_extent = new ZoneExtent(extent->start_,extent->length_, zone);
+
+    extents_.push_back(new_extent);
+    fprintf(stderr, "Push Extent info in ZoneFile::MergeUpdate\n");
+    ZoneExtentInfo* new_extent_info = new ZoneExtentInfo(new_extent, this, true, extent->length_, new_extent->start_, new_extent->zone_, filename_, this->lifetime_, this->level_);
+    zone->PushExtentInfo(new_extent_info);
   }
   extent_start_ = update->GetExtentStart();
   is_sparse_ = update->IsSparse();
@@ -231,7 +248,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
   return Status::OK();
 }
 
-ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id,
+ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename, uint64_t file_id,
                    MetadataWriter* metadata_writer)
     : zbd_(zbd),
       active_zone_(NULL),
@@ -240,12 +257,29 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id,
       lifetime_(Env::WLTH_NOT_SET),
       io_type_(IOType::kUnknown),
       file_size_(0),
+      filename_(filename),
       file_id_(file_id),
       nr_synced_extents_(0),
       m_time_(0),
-      metadata_writer_(metadata_writer) { env_ = Env::Default(); }
+      metadata_writer_(metadata_writer),
+      level_(100),
+      extent_writer(false),
+      extent_reader(0) { 
+        env_ = Env::Default();
+        std::string fname_wo_path = filename_.substr(filename_.size() - 10);
+        if (fname_wo_path.substr(fname_wo_path.size() -3) == "sst") {
+            std::string fnostr = fname_wo_path.substr(0, 6);
+            fno_ = std::stoull(fnostr); 
+            is_sst_ = true;
+        } else {
+            is_sst_ = false;
+        }
+      }
 
-std::string ZoneFile::GetFilename() { return linkfiles_[0]; }
+std::string ZoneFile::GetFilename() { 
+  assert(filename_ == linkfiles_[0]);
+  return linkfiles_[0]; 
+}
 time_t ZoneFile::GetFileModificationTime() { return m_time_; }
 
 uint64_t ZoneFile::GetFileSize() { return file_size_; }
@@ -283,7 +317,6 @@ IOStatus ZoneFile::CloseActiveZone() {
   }
 
   end_t_ = env_->NowMicros();
-  zbd_->UnLockLevelMutex(lifetime_);
   
   return s;
 }
@@ -431,12 +464,29 @@ void ZoneFile::PushExtent() {
   assert(file_size_ >= extent_filepos_);
 
   if (!active_zone_) return;
-
+  //(ZC)::Extent length could be less than exactly data size written zone.
+  //This is because block size alignment.
   length = file_size_ - extent_filepos_;
   if (length == 0) return;
 
   assert(length <= (active_zone_->wp_ - extent_start_));
-  extents_.push_back(new ZoneExtent(extent_start_, length, active_zone_));
+
+  ZoneExtent * new_extent = new ZoneExtent(extent_start_, length, active_zone_); 
+  extents_.push_back(new_extent);
+  //(ZC) Add inforamtion about currently written extent into the Zone. So that make it easier to track validity of the extents in zone in processing Zone Cleaning
+  fprintf(stdout, "is_sst : %d\n", (is_sst_ == true) ? 1 : 0);
+  if (is_sst_) {
+    auto search = zbd_->sst_to_zone_.find(fno_);
+    if (search == zbd_->sst_to_zone_.end()){
+      // zbd_->sst_zone_mtx_.lock();
+      zbd_->sst_to_zone_.insert(std::pair<uint64_t, std::vector<int> >(fno_, {active_zone_->zone_id_}));
+    } else {
+      // zbd_->sst_zone_mtx_.lock();
+      zbd_->sst_to_zone_[fno_].push_back(active_zone_->zone_id_);
+    }
+    // zbd_->sst_zone_mtx_.unlock();
+  }
+  active_zone_->PushExtentInfo(new ZoneExtentInfo(new_extent, this, true, length, new_extent->start_, new_extent->zone_, this->GetFilename(), this->lifetime_, this->level_));
 
   active_zone_->used_capacity_ += length;
   extent_start_ = active_zone_->wp_;
@@ -447,9 +497,8 @@ IOStatus ZoneFile::AllocateNewZone() {
   Zone* zone;
 
   start_t_ = env_->NowMicros();
-  zbd_->LockLevelMutex(lifetime_);
 
-  IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
+  IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone, this);
 
   if (!s.ok()) return s;
   if (!zone) {

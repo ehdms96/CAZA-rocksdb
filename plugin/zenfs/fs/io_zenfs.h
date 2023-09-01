@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
@@ -64,6 +65,7 @@ class ZoneFile {
   Env::WriteLifeTimeHint lifetime_;
   IOType io_type_; /* Only used when writing */
   uint64_t file_size_;
+  std::string filename_;
   uint64_t file_id_;
 
   uint32_t nr_synced_extents_ = 0;
@@ -85,9 +87,18 @@ class ZoneFile {
 
 
  public:
+  InternalKey smallest_; //CZ
+  InternalKey largest_; //CZ
+  int level_; //CZ
+  bool is_sst_; //CZ
+  uint64_t fno_; //CZ
+
+  std::atomic<bool> extent_writer;
+  std::atomic<unsigned int> extent_reader;
+  
   static const int SPARSE_HEADER_SIZE = 8;
 
-  explicit ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id_,
+  explicit ZoneFile(ZonedBlockDevice* zbd, std::string filename, uint64_t file_id_,
                     MetadataWriter* metadata_writer);
 
   virtual ~ZoneFile();
