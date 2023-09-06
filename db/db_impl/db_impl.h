@@ -185,6 +185,14 @@ class DBImpl : public DB {
 
   virtual ~DBImpl();
 
+  const InternalKeyComparator* GetDefaultICMP();
+
+  void FindClosestFilesWithSameLevel(const int, std::vector<uint64_t>&); 
+
+  void AdjacentFileList(const InternalKey&, const InternalKey&, const int, std::vector<uint64_t>&); 
+
+  void SameLevelFileList(const int, std::vector<uint64_t>&); 
+
   // ---- Implementations of the DB interface ----
 
   using DB::Resume;

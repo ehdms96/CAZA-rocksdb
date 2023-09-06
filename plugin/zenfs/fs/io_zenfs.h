@@ -28,6 +28,29 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class Buffer {
+ public:
+  int buffer_size_;
+  int valid_size_;
+  char* buffer_;
+
+  explicit Buffer(void* data, int data_size, int valid_size)
+      :buffer_size_(data_size),
+       valid_size_(valid_size)
+       {
+          int ret = posix_memalign((void**)&buffer_, 4096, data_size);
+          if (ret) {
+            fprintf(stderr, "failed allocating alignment write buffer\n");
+          }
+          memcpy(buffer_, data, buffer_size_);
+       };
+
+  ~Buffer(){
+    delete (char*)buffer_;
+  }
+
+};
+
 class ZoneExtent {
  public:
   uint64_t start_;
@@ -69,6 +92,7 @@ class ZoneFile {
   uint64_t file_id_;
 
   uint32_t nr_synced_extents_ = 0;
+  std::vector<Buffer*> full_buffer_;
   bool open_for_wr_ = false;
   std::mutex open_for_wr_mtx_;
 
@@ -90,11 +114,15 @@ class ZoneFile {
   InternalKey smallest_; //CZ
   InternalKey largest_; //CZ
   int level_; //CZ
+  std::atomic<bool> is_appending_;
+  bool should_flush_full_buffer_;
   bool is_sst_; //CZ
   uint64_t fno_; //CZ
 
   std::atomic<bool> extent_writer;
   std::atomic<unsigned int> extent_reader;
+
+  IOStatus FullBuffer(void*, int, int);
   
   static const int SPARSE_HEADER_SIZE = 8;
 
@@ -111,7 +139,8 @@ class ZoneFile {
   bool IsOpenForWR();
 
   IOStatus PersistMetadata();
-
+  IOStatus AppendBuffer_caza();
+  IOStatus Append_caza(void* data, int data_size, int valid_size);
   IOStatus Append(void* buffer, int data_size);
   IOStatus BufferedAppend(char* data, uint32_t size);
   IOStatus SparseAppend(char* data, uint32_t size);
@@ -134,6 +163,12 @@ class ZoneFile {
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
   IOStatus AllocateNewZone();
+
+  void ExtentReadLock();
+  void ExtentReadUnlock();
+
+  void ExtentWriteLock();
+  void ExtentWriteUnlock();
 
   void EncodeTo(std::string* output, uint32_t extent_start);
   void EncodeUpdateTo(std::string* output) {
@@ -249,6 +284,9 @@ class ZonedWritableFile : public FSWritableFile {
   virtual Env::WriteLifeTimeHint GetWriteLifeTimeHint() override {
     return zoneFile_->GetWriteLifeTimeHint();
   }
+
+  void ShouldFlushFullBuffer();
+  void SetMinMaxKeyAndLevel(const Slice&, const Slice&, const int);
 
  private:
   IOStatus BufferedWrite(const Slice& data);

@@ -376,6 +376,12 @@ class FSWritableFilePtr {
     fs_tracer_.reset();
     io_tracer_ = nullptr;
   }
+  void ShouldFlushFullBuffer() {
+    fs_tracer_->target()->ShouldFlushFullBuffer();
+  }
+  void SetMinMaxKeyAndLevel(const Slice& smallest, const Slice& largest, const int level) {
+    fs_tracer_->target()->SetMinMaxKeyAndLevel(smallest, largest, level);
+  }
 
  private:
   std::shared_ptr<IOTracer> io_tracer_;

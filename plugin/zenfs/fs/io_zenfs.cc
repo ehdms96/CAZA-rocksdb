@@ -263,6 +263,8 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename, uint64_t file_id
       m_time_(0),
       metadata_writer_(metadata_writer),
       level_(100),
+      is_appending_(false),
+      should_flush_full_buffer_(false),
       extent_writer(false),
       extent_reader(0) { 
         env_ = Env::Default();
@@ -290,13 +292,33 @@ void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
 ZoneFile::~ZoneFile() { ClearExtents(); }
 
 void ZoneFile::ClearExtents() {
+  // zbd_->zone_cleaning_mtx.lock();
+  // if (is_sst_) {
+  //   zbd_->sst_zone_mtx_.lock();
+    
+  //   auto search = zbd_->sst_to_zone_.find(fno_);
+  //   if(search != zbd_->sst_to_zone_.end()){
+  //     zbd_->sst_to_zone_.erase(search);
+  //   }
+  //   zbd_->sst_zone_mtx_.unlock();
+
+  //   zbd_->files_mtx_.lock();
+  //   auto search2 = zbd_->files_.find(fno_);
+  //   if (search2 != zbd_->files_.end()){
+  //     zbd_->files_.erase(search2);
+  //   }
+  //   zbd_->files_mtx_.unlock();
+  // }
+
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
+    // zone->Invalidate(*e);
     delete *e;
   }
+  // zbd_->zone_cleaning_mtx.unlock();
   extents_.clear();
 }
 
@@ -356,14 +378,17 @@ IOStatus ZoneFile::PersistMetadata() {
 }
 
 ZoneExtent* ZoneFile::GetExtent(uint64_t file_offset, uint64_t* dev_offset) {
+  // ExtentReadLock();
   for (unsigned int i = 0; i < extents_.size(); i++) {
     if (file_offset < extents_[i]->length_) {
       *dev_offset = extents_[i]->start_ + file_offset;
+      // ExtentReadUnlock();
       return extents_[i];
     } else {
       file_offset -= extents_[i]->length_;
     }
   }
+  // ExtentReadUnlock();
   return NULL;
 }
 
@@ -474,18 +499,19 @@ void ZoneFile::PushExtent() {
   ZoneExtent * new_extent = new ZoneExtent(extent_start_, length, active_zone_); 
   extents_.push_back(new_extent);
   //(ZC) Add inforamtion about currently written extent into the Zone. So that make it easier to track validity of the extents in zone in processing Zone Cleaning
-  fprintf(stdout, "is_sst : %d\n", (is_sst_ == true) ? 1 : 0);
+  // fprintf(stdout, "is_sst : %d\n", (is_sst_ == true) ? 1 : 0);
   if (is_sst_) {
     auto search = zbd_->sst_to_zone_.find(fno_);
     if (search == zbd_->sst_to_zone_.end()){
-      // zbd_->sst_zone_mtx_.lock();
+      zbd_->sst_zone_mtx_.lock();
       zbd_->sst_to_zone_.insert(std::pair<uint64_t, std::vector<int> >(fno_, {active_zone_->zone_id_}));
     } else {
-      // zbd_->sst_zone_mtx_.lock();
+      zbd_->sst_zone_mtx_.lock();
       zbd_->sst_to_zone_[fno_].push_back(active_zone_->zone_id_);
     }
-    // zbd_->sst_zone_mtx_.unlock();
+    zbd_->sst_zone_mtx_.unlock();
   }
+  // fprintf(stdout, "PushExtentInfo this->level_ : %d\n", this->level_);
   active_zone_->PushExtentInfo(new ZoneExtentInfo(new_extent, this, true, length, new_extent->start_, new_extent->zone_, this->GetFilename(), this->lifetime_, this->level_));
 
   active_zone_->used_capacity_ += length;
@@ -496,7 +522,8 @@ void ZoneFile::PushExtent() {
 IOStatus ZoneFile::AllocateNewZone() {
   Zone* zone;
 
-  start_t_ = env_->NowMicros();
+  // std::cout << "ZoneFile::AllocateNewZone() zoneFile name : " << GetFilename() << " ";
+  // fprintf(stdout, "ZoneFile::AllocateNewZone() this->level_ : %d, level : %d\n", this->level_, level_);
 
   IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone, this);
 
@@ -515,14 +542,12 @@ IOStatus ZoneFile::AllocateNewZone() {
 }
 
 /* Byte-aligned writes without a sparse header */
-IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
+IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) { //orizin zenfs
   uint32_t left = data_size;
   uint32_t wr_size;
   uint32_t block_sz = GetBlockSize();
   IOStatus s;
-
-  //zbd_->LockLevelMutex(lifetime_);
-
+  
   if (active_zone_ == NULL) {
     s = AllocateNewZone();
     if (!s.ok()) return s;
@@ -567,8 +592,6 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
     }
   }
 
-  //zbd_->UnLockLevelMutex(lifetime_);
-
   return IOStatus::OK();
 }
 
@@ -580,8 +603,6 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
   uint32_t block_sz = GetBlockSize();
   IOStatus s;
 
-  //zbd_->LockLevelMutex(lifetime_);
- 
   if (active_zone_ == NULL) {
     s = AllocateNewZone();
     if (!s.ok()) return s;
@@ -636,8 +657,6 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
     }
   }
 
-  //zbd_->UnLockLevelMutex(lifetime_);
-
   return IOStatus::OK();
 }
 
@@ -647,8 +666,8 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
   uint32_t wr_size, offset = 0;
   IOStatus s = IOStatus::OK();
 
-  //zbd_->LockLevelMutex(lifetime_);
-
+  // std::cout << "ZoneFile::Append zoneFile name : " << GetFilename() << std::endl;
+  
   if (!active_zone_) {
     s = AllocateNewZone();
     if (!s.ok()) return s;
@@ -658,7 +677,7 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
     if (active_zone_->capacity_ == 0) {
       PushExtent();
 
-      s = CloseActiveZone(); // close twice?
+      s = CloseActiveZone();
       if (!s.ok()) {
         return s;
       }
@@ -678,8 +697,141 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
     offset += wr_size;
   }
 
-  //zbd_->UnLockLevelMutex(lifetime_);
+  return IOStatus::OK();
+}
 
+IOStatus ZoneFile::FullBuffer(void* data, int data_size, int valid_size) {
+    Buffer * buf = new Buffer(data, data_size, valid_size);
+    full_buffer_.push_back(buf);
+
+    return IOStatus::OK();
+}
+
+/* Assumes that data and size are block aligned */
+IOStatus ZoneFile::AppendBuffer_caza() { //caza
+  // fprintf(stdout, "ZoneFile::AppendBuffer_caza()\n");
+  char * data;
+  uint32_t data_size = 0;
+  int valid_size = 0;
+  uint32_t buf_offset = 0;
+
+  for(const auto& b : full_buffer_) {
+    data_size += b->buffer_size_;
+    valid_size += b->valid_size_;
+  }
+  int ret = posix_memalign((void**)&data, GetBlockSize(), data_size);
+  if (ret) {
+      return IOStatus::IOError("failed allocating alignment write buffer\n");
+  }
+  for(const auto& b : full_buffer_) {
+    memcpy(data + buf_offset, b->buffer_, b->buffer_size_);
+    buf_offset += b->buffer_size_;
+  }
+  
+  uint32_t left = data_size;
+  uint32_t wr_size, offset = 0;
+  IOStatus s;
+
+  // fprintf(stdout, "ZoneFile::AllocateNewZone()=AppendBuffer() this->level_ : %d, level : %d\n", this->level_, level_);
+
+  if (active_zone_ == NULL) {
+    s = AllocateNewZone();
+    if (!s.ok()) return s;
+
+    extent_start_ = active_zone_->wp_;
+    extent_filepos_ = file_size_;
+  }
+
+  while (left) {
+    if (active_zone_->capacity_ == 0) {
+      PushExtent();
+
+      s = CloseActiveZone();
+      if (!s.ok()) {
+        return s;
+      }
+
+      s = AllocateNewZone();
+      if (!s.ok()) return s;
+
+      extent_start_ = active_zone_->wp_;
+      extent_filepos_ = file_size_;
+    }
+
+    wr_size = left;
+    if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
+    s = active_zone_->Append((char*)data + offset, wr_size);
+
+    if (!s.ok()){ 
+        return s;
+    }
+
+    file_size_ += wr_size;
+    left -= wr_size;
+    offset += wr_size;
+  }
+  file_size_ -= (data_size - valid_size);
+  
+  delete data;
+  
+  for(auto& b : full_buffer_) {
+    delete b->buffer_;
+  }
+  
+  full_buffer_.clear();  
+  return IOStatus::OK();
+}
+
+/* Assumes that data and size are block aligned */
+IOStatus ZoneFile::Append_caza(void* data, int data_size, int valid_size) {
+  // fprintf(stdout, "ZoneFile::Append_caza level_ : %d ", level_);
+  // fprintf(stdout, "should_flush_full_buffer_ : %d\n", (should_flush_full_buffer_ == true) ? 1 : 0);
+  if (is_sst_) {
+      if(should_flush_full_buffer_) {
+        FullBuffer(data, data_size, valid_size);
+        return AppendBuffer_caza();
+      } else {
+        return FullBuffer(data, data_size, valid_size);
+      }
+  } 
+  uint32_t left = data_size;
+  uint32_t wr_size, offset = 0;
+  IOStatus s;
+
+  if (!active_zone_) {
+    s = AllocateNewZone();
+    if (!s.ok()) return s;
+
+    extent_start_ = active_zone_->wp_;
+    extent_filepos_ = file_size_;
+  }
+
+  while (left) {
+    if (active_zone_->capacity_ == 0) {
+      PushExtent(); 
+      
+      s = CloseActiveZone();
+      if (!s.ok()) {
+        return s;
+      }
+
+      s = AllocateNewZone();
+      if (!s.ok()) return s;
+
+      extent_start_ = active_zone_->wp_;
+      extent_filepos_ = file_size_;
+    }
+
+    wr_size = left;
+    if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
+    s = active_zone_->Append((char*)data + offset, wr_size);
+    if (!s.ok()) return s;
+
+    file_size_ += wr_size;
+    left -= wr_size;
+    offset += wr_size;
+  }
+  file_size_ -= (data_size - valid_size);
   return IOStatus::OK();
 }
 
@@ -914,6 +1066,13 @@ IOStatus ZonedWritableFile::DataSync() {
      * the file size */
     if (!zoneFile_->IsSparse()) return zoneFile_->PersistMetadata();
   } else {
+    if(zoneFile_->GetZbd()->zone_alloc_mode == 2 && zoneFile_->should_flush_full_buffer_){
+      IOStatus s;
+      buffer_mtx_.lock();
+      s = zoneFile_->AppendBuffer_caza();
+      buffer_mtx_.unlock();
+      if (!s.ok()) return s;
+    }
     /* For direct writes, there is no buffer to flush, we just need to push
        an extent for the latest written data */
     zoneFile_->PushExtent();
@@ -925,6 +1084,9 @@ IOStatus ZonedWritableFile::DataSync() {
 IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
                                   IODebugContext* /*dbg*/) {
   IOStatus s;
+  // std::cout << "zoneWritableFile::Fsync zoneFile name : " << zoneFile_->GetFilename() << "file size : " << zoneFile_->GetFileSize() << " file level : " << zoneFile_->level_ << std::endl;
+  ShouldFlushFullBuffer();
+  zoneFile_->is_appending_.store(true);
   ZenFSMetricsLatencyGuard guard(zoneFile_->GetZBDMetrics(),
                                  zoneFile_->GetIOType() == IOType::kWAL
                                      ? ZENFS_WAL_SYNC_LATENCY
@@ -937,7 +1099,7 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
 
   /* As we've already synced the metadata in DataSync, no need to do it again */
   if (buffered && !zoneFile_->IsSparse()) return IOStatus::OK();
-
+  zoneFile_->is_appending_.store(false);
   return zoneFile_->PersistMetadata();
 }
 
@@ -983,7 +1145,7 @@ IOStatus ZonedWritableFile::FlushBuffer() {
   IOStatus s;
 
   if (buffer_pos == 0) return IOStatus::OK();
-
+  // std::cout << "ZonedWritableFile::FlushBuffer() zoneFile name : " << zoneFile_->GetFilename() << std::endl;
   if (zoneFile_->IsSparse()) {
     s = zoneFile_->SparseAppend(sparse_buffer, buffer_pos);
   } else {
@@ -1000,6 +1162,7 @@ IOStatus ZonedWritableFile::FlushBuffer() {
   return IOStatus::OK();
 }
 
+//어차피 sst는 bufferedwrite아님
 IOStatus ZonedWritableFile::BufferedWrite(const Slice& slice) {
   uint32_t data_left = slice.size();
   char* data = (char*)slice.data();
@@ -1029,6 +1192,7 @@ IOStatus ZonedWritableFile::BufferedWrite(const Slice& slice) {
   return IOStatus::OK();
 }
 
+// MANIFEST / dbtmp 들어오는 곳
 IOStatus ZonedWritableFile::Append(const Slice& data,
                                    const IOOptions& /*options*/,
                                    IODebugContext* /*dbg*/) {
@@ -1041,7 +1205,7 @@ IOStatus ZonedWritableFile::Append(const Slice& data,
   zoneFile_->GetZBDMetrics()->ReportQPS(ZENFS_WRITE_QPS, 1);
   zoneFile_->GetZBDMetrics()->ReportThroughput(ZENFS_WRITE_THROUGHPUT,
                                                data.size());
-
+  zoneFile_->is_appending_.store(true);
   if (buffered) {
     buffer_mtx_.lock();
     s = BufferedWrite(data);
@@ -1050,14 +1214,16 @@ IOStatus ZonedWritableFile::Append(const Slice& data,
     s = zoneFile_->Append((void*)data.data(), data.size());
     if (s.ok()) wp += data.size();
   }
-
+  zoneFile_->is_appending_.store(false);
   return s;
 }
 
+//실질적인 SST파일 들어오는 곳. not buffered
 IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t offset,
                                              const IOOptions& /*options*/,
                                              IODebugContext* /*dbg*/) {
   IOStatus s;
+  zoneFile_->is_appending_.store(true);
   ZenFSMetricsLatencyGuard guard(zoneFile_->GetZBDMetrics(),
                                  zoneFile_->GetIOType() == IOType::kWAL
                                      ? ZENFS_WAL_WRITE_LATENCY
@@ -1072,20 +1238,42 @@ IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t offset,
     return IOStatus::IOError("positioned append not at write pointer");
   }
 
+  // std::cout << "ZonedWritableFile::PositionedAppend zoneFile name : " << zoneFile_->GetFilename() << "file size : " << zoneFile_->GetFileSize() << " file level : " << zoneFile_->level_ << std::endl;
+  
   if (buffered) {
     buffer_mtx_.lock();
     s = BufferedWrite(data);
     buffer_mtx_.unlock();
   } else {
-    s = zoneFile_->Append((void*)data.data(), data.size());
+    if(zoneFile_->GetZbd()->zone_alloc_mode == 2) { //CAZA mode
+      s = zoneFile_->Append_caza((void*)data.data(), data.size(), data.size());
+    }
+    else{
+      s = zoneFile_->Append((void*)data.data(), data.size());
+    }
     if (s.ok()) wp += data.size();
   }
-
+  zoneFile_->is_appending_.store(false);
   return s;
 }
 
 void ZonedWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
   zoneFile_->SetWriteLifeTimeHint(hint);
+}
+
+void ZonedWritableFile::ShouldFlushFullBuffer() {
+  zoneFile_->should_flush_full_buffer_ = true;
+}
+
+void ZonedWritableFile::SetMinMaxKeyAndLevel(const Slice& s, const Slice& l, const int level) {
+  zoneFile_->smallest_.DecodeFrom(s);
+  zoneFile_->largest_.DecodeFrom(l);
+  zoneFile_->level_ = level;
+  zoneFile_->GetZbd()->files_mtx_.lock();
+  zoneFile_->GetZbd()->files_.insert(std::make_pair(zoneFile_->fno_, zoneFile_));
+  zoneFile_->GetZbd()->files_mtx_.unlock();
+  // std::cout << "zoneWritableFile::SetMinMaxKeyAndLevel zoneFile name : " << zoneFile_->GetFilename() << " ";
+  // fprintf(stdout, "SetMinMaxKeyAndLevel! level_ : %d\n", zoneFile_->level_);
 }
 
 IOStatus ZonedSequentialFile::Read(size_t n, const IOOptions& /*options*/,

@@ -300,6 +300,10 @@ ZenFS::~ZenFS() {
   delete zbd_;
 }
 
+void ZenFS::SetDBPointer(DBImpl* db){
+  db_ptr_ = db;
+  zbd_->SetDBPointer(db);
+}
 
 std::string time_in_HH_MM_SS_MMM_l()
 {

@@ -31,6 +31,11 @@ Status FileSystem::Load(const std::string& value,
   return CreateFromString(ConfigOptions(), value, result);
 }
 
+//dummy for ZenFS
+void FileSystem::SetDBPointer(DBImpl* db){
+  db_ptr_ = db;
+}
+
 #ifndef ROCKSDB_LITE
 static int RegisterBuiltinFileSystems(ObjectLibrary& library,
                                       const std::string& /*arg*/) {

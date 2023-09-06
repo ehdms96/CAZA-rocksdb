@@ -198,6 +198,7 @@ class ZonedBlockDevice {
  private:
   std::unique_ptr<ZonedBlockDeviceBackend> zbd_be_;
   std::vector<Zone *> io_zones;
+  std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
   time_t start_time_;
   std::shared_ptr<Logger> logger_;
@@ -205,7 +206,7 @@ class ZonedBlockDevice {
   std::atomic<uint64_t> bytes_written_{0};
   std::atomic<uint64_t> gc_bytes_written_{0};
 
-  unsigned int zone_alloc_mode; // 1: default , 2: modified by KH
+  
   bool logging_mode;
   //for wait-count when if lifetime
   std::atomic<int64_t> short_cnt_{0};
@@ -247,9 +248,14 @@ class ZonedBlockDevice {
                       const std::vector<Zone *> zones);
 
  public:
+  unsigned int zone_alloc_mode; // 1: default , 2: CAZA (modified by DE)
+  DBImpl* db_ptr_;
+  void SetDBPointer(DBImpl* db);
   std::map<uint64_t, std::vector<int>> sst_to_zone_;
   std::map<int, Zone*> id_to_zone_;
   std::mutex sst_zone_mtx_;
+  std::map<uint64_t, std::shared_ptr<ZoneFile>> files_;
+  std::mutex files_mtx_;
 
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
@@ -320,7 +326,7 @@ class ZonedBlockDevice {
   IOStatus FinishCheapestIOZone();
   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
   
-  IOStatus GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime, Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0); 
+  IOStatus GetBestCAZAMatch(Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0); 
   void AdjacentFileList(const InternalKey&, const InternalKey&, const int, std::vector<uint64_t>&);
   
   
