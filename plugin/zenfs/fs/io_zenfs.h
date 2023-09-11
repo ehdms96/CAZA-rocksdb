@@ -154,6 +154,7 @@ class ZoneFile {
   void ClearExtents();
 
   uint32_t GetBlockSize() { return zbd_->GetBlockSize(); }
+  Zone* GetActiveZone() { return active_zone_; }
   ZonedBlockDevice* GetZbd() { return zbd_; }
   std::vector<ZoneExtent*> GetExtents() { return extents_; }
   Env::WriteLifeTimeHint GetWriteLifeTimeHint() { return lifetime_; }

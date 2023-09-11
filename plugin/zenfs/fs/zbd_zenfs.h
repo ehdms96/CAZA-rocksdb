@@ -126,6 +126,8 @@ class Zone {
   
   std::vector<ZoneExtentInfo *> extent_info_; //CZ
   int zone_id_; //CZ
+  void Invalidate(ZoneExtent* extent); //CZ
+  int GetIOZoneID() { return start_/2147483648; }
 
   void PushExtentInfo(ZoneExtentInfo* extent_info) { 
     extent_info_.push_back(extent_info);
@@ -318,6 +320,9 @@ class ZonedBlockDevice {
   };
   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
 
+  void PrintVictimInformation(const Zone*, bool = true); //CZ
+  void printZoneExtentInfo(const std::vector<ZoneExtentInfo *>&, bool = true); //CZ
+
  private:
   IOStatus GetZoneDeferredStatus();
   bool GetActiveIOZoneTokenIfAvailable();
@@ -326,10 +331,11 @@ class ZonedBlockDevice {
   IOStatus FinishCheapestIOZone();
   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
   
-  IOStatus GetBestCAZAMatch(Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0); 
+  IOStatus GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, int *new_out, Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0);
+  IOStatus AllocateMostL0Files(const std::set<int>&, Zone **zone_out,  uint32_t min_capacity);
+  Zone * AllocateZoneWithSameLevelFiles(const std::vector<uint64_t>&, const InternalKey, const InternalKey, uint32_t min_capacity);
+  void SameLevelFileList(const int, std::vector<uint64_t>&); 
   void AdjacentFileList(const InternalKey&, const InternalKey&, const int, std::vector<uint64_t>&);
-  
-  
   IOStatus AllocateEmptyZone(Zone **zone_out);
 };
 

@@ -293,29 +293,29 @@ ZoneFile::~ZoneFile() { ClearExtents(); }
 
 void ZoneFile::ClearExtents() {
   // zbd_->zone_cleaning_mtx.lock();
-  // if (is_sst_) {
-  //   zbd_->sst_zone_mtx_.lock();
+  if (is_sst_) {
+    zbd_->sst_zone_mtx_.lock();
     
-  //   auto search = zbd_->sst_to_zone_.find(fno_);
-  //   if(search != zbd_->sst_to_zone_.end()){
-  //     zbd_->sst_to_zone_.erase(search);
-  //   }
-  //   zbd_->sst_zone_mtx_.unlock();
+    auto search = zbd_->sst_to_zone_.find(fno_);
+    if(search != zbd_->sst_to_zone_.end()){
+      zbd_->sst_to_zone_.erase(search);
+    }
+    zbd_->sst_zone_mtx_.unlock();
 
-  //   zbd_->files_mtx_.lock();
-  //   auto search2 = zbd_->files_.find(fno_);
-  //   if (search2 != zbd_->files_.end()){
-  //     zbd_->files_.erase(search2);
-  //   }
-  //   zbd_->files_mtx_.unlock();
-  // }
+    zbd_->files_mtx_.lock();
+    auto search2 = zbd_->files_.find(fno_);
+    if (search2 != zbd_->files_.end()){
+      zbd_->files_.erase(search2);
+    }
+    zbd_->files_mtx_.unlock();
+  }
 
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
-    // zone->Invalidate(*e);
+    zone->Invalidate(*e);
     delete *e;
   }
   // zbd_->zone_cleaning_mtx.unlock();
@@ -737,9 +737,6 @@ IOStatus ZoneFile::AppendBuffer_caza() { //caza
   if (active_zone_ == NULL) {
     s = AllocateNewZone();
     if (!s.ok()) return s;
-
-    extent_start_ = active_zone_->wp_;
-    extent_filepos_ = file_size_;
   }
 
   while (left) {
@@ -753,18 +750,13 @@ IOStatus ZoneFile::AppendBuffer_caza() { //caza
 
       s = AllocateNewZone();
       if (!s.ok()) return s;
-
-      extent_start_ = active_zone_->wp_;
-      extent_filepos_ = file_size_;
     }
 
     wr_size = left;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
+    
     s = active_zone_->Append((char*)data + offset, wr_size);
-
-    if (!s.ok()){ 
-        return s;
-    }
+    if (!s.ok()) return s;
 
     file_size_ += wr_size;
     left -= wr_size;
@@ -772,6 +764,8 @@ IOStatus ZoneFile::AppendBuffer_caza() { //caza
   }
   file_size_ -= (data_size - valid_size);
   
+  // zbd_->PrintVictimInformation(active_zone_);
+
   delete data;
   
   for(auto& b : full_buffer_) {

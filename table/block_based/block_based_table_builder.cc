@@ -898,7 +898,7 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     // silently convert format_version to 1 to keep consistent with current
     // behavior
     sanitized_table_options.format_version = 1;
-    // skip_filters_ = skip_filters;
+    // skip_filters_ = tbo.skip_filters;
   }
 
   rep_ = new Rep(sanitized_table_options, tbo, file);
