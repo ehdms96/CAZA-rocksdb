@@ -25,6 +25,7 @@ namespace fs = std::filesystem;
 #include "snapshot.h"
 #include "version.h"
 #include "zbd_zenfs.h"
+#include "db/db_impl/db_impl.h" // to do check.
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -139,6 +140,8 @@ class ZenFS : public FileSystemWrapper {
   std::shared_ptr<Logger> logger_;
   std::atomic<uint64_t> next_file_id_;
 
+  DBImpl* db_ptr_;
+
   Zone* cur_meta_zone_ = nullptr;
   std::unique_ptr<ZenMetaLog> meta_log_;
   std::mutex metadata_sync_mtx_;
@@ -174,6 +177,9 @@ class ZenFS : public FileSystemWrapper {
     kFileReplace = 5,
   };
 
+  void SetDBPointer(DBImpl* db);
+  // int GetZonedFileExtentNum(const uint64_t fileno);
+  void GetExtentInfo(const uint64_t fileno, const int ext_no, int& zone_id, uint32_t& extent_length, uint32_t& extent_start); 
   void LogFiles();
   void ClearFiles();
   std::string FormatPathLexically(fs::path filepath);
@@ -464,8 +470,8 @@ class ZenFS : public FileSystemWrapper {
       const std::vector<ZoneExtentSnapshot*>& migrate_exts);
 
   private:
-    const uint64_t GC_START_LEVEL = 30; /* Enable GC when < 20% free space available */
-    const uint64_t GC_SLOPE = 6; /* GC agressiveness */
+    const uint64_t GC_START_LEVEL = 90; /* Enable GC when < 20% free space available */
+    const uint64_t GC_SLOPE = 3; /* GC agressiveness */
     void GCWorker();
     void DZAWorker();
 };

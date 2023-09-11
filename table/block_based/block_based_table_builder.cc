@@ -289,8 +289,11 @@ struct BlockBasedTableBuilder::Rep {
   std::vector<std::unique_ptr<UncompressionContext>> verify_ctxs;
   std::unique_ptr<UncompressionDict> verify_dict;
 
-  size_t data_begin_offset = 0;
+  Slice smallest; //smallest key in current table
+  Slice largest; //largest key in current table
 
+  size_t data_begin_offset = 0;
+  // Slice kkey;
   TableProperties props;
 
   // States of the builder.
@@ -331,6 +334,8 @@ struct BlockBasedTableBuilder::Rep {
 
   std::string compressed_output;
   std::unique_ptr<FlushBlockPolicy> flush_block_policy;
+  
+  int level_at_creation;
 
   std::vector<std::unique_ptr<IntTblPropCollector>> table_properties_collectors;
 
@@ -443,6 +448,7 @@ struct BlockBasedTableBuilder::Rep {
         flush_block_policy(
             table_options.flush_block_policy_factory->NewFlushBlockPolicy(
                 table_options, data_block)),
+        level_at_creation(tbo.level_at_creation),
         status_ok(true),
         io_status_ok(true) {
     if (tbo.target_file_size == 0) {
@@ -882,6 +888,7 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     const BlockBasedTableOptions& table_options, const TableBuilderOptions& tbo,
     WritableFileWriter* file) {
   BlockBasedTableOptions sanitized_table_options(table_options);
+  // int_tbl_prop_collector_factories_ = tbo.int_tbl_prop_collector_factories;
   if (sanitized_table_options.format_version == 0 &&
       sanitized_table_options.checksum != kCRC32c) {
     ROCKS_LOG_WARN(
@@ -891,6 +898,7 @@ BlockBasedTableBuilder::BlockBasedTableBuilder(
     // silently convert format_version to 1 to keep consistent with current
     // behavior
     sanitized_table_options.format_version = 1;
+    // skip_filters_ = tbo.skip_filters;
   }
 
   rep_ = new Rep(sanitized_table_options, tbo, file);
@@ -911,12 +919,19 @@ BlockBasedTableBuilder::~BlockBasedTableBuilder() {
   // Catch errors where caller forgot to call Finish()
   assert(rep_->state == Rep::State::kClosed);
   delete rep_;
+  // for(auto r : reps_to_flush) delete r;
 }
 
 void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
   Rep* r = rep_;
   assert(rep_->state != Rep::State::kClosed);
   if (!ok()) return;
+
+  if (r->smallest.size()==0) {
+    r->smallest = key;
+  }
+  r->largest = key;
+
   ValueType value_type = ExtractValueType(key);
   if (IsValueType(value_type)) {
 #ifndef NDEBUG
@@ -2010,6 +2025,12 @@ Status BlockBasedTableBuilder::Finish() {
   if (ok()) {
     WriteFooter(metaindex_block_handle, index_block_handle);
   }
+
+  if (r->file->file_name().substr(r->file->file_name().size() -3) == "sst") {
+    // fprintf(stdout, "BlockBasedTableBuilder::EnterUnbuffered() I am sst level_at_creation is : %d\n", r->level_at_creation);
+    r->file->SetMinMaxKeyAndLevel(r->smallest, r->largest, r->level_at_creation);
+  }
+  
   r->state = Rep::State::kClosed;
   r->SetStatus(r->CopyIOStatus());
   Status ret_status = r->CopyStatus();

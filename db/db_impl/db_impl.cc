@@ -251,7 +251,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   // !batch_per_trx_ implies seq_per_batch_ because it is only unset for
   // WriteUnprepared, which should use seq_per_batch_.
   assert(batch_per_txn_ || seq_per_batch_);
-
+  fs_->SetDBPointer(this);
   // Reserve ten files or so for other uses and give the rest to TableCache.
   // Give a large number for setting of "infinite" open files.
   const int table_cache_size = (mutable_db_options_.max_open_files == -1)
@@ -294,6 +294,67 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
                             std::memory_order_relaxed);
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
+  }
+}
+
+const InternalKeyComparator* DBImpl::GetDefaultICMP(){
+
+  auto vstorage = versions_->GetColumnFamilySet()->GetDefault()->current()->storage_info();
+  return vstorage->InternalComparator();
+
+}
+
+// void DBImpl::FindClosestFilesWithSameLevel(const int level, std::vector<uint64_t>& fno_list) {
+
+//   auto vstorage = versions_->GetColumnFamilySet()->GetDefault()->current()->storage_info();
+//   auto files = vstorage->LevelFiles(level);
+  
+//   for (const auto f : files) {
+//     uint64_t fno = f->fd.GetNumber();
+//     fno_list.push_back(fno);
+//   }
+
+// }
+
+void DBImpl::SameLevelFileList(const int level, std::vector<uint64_t>& fno_list){
+
+  auto vstorage = versions_->GetColumnFamilySet()->GetDefault()->current()->storage_info();
+
+  auto files = vstorage->LevelFiles(level);
+  
+  for (const auto f : files) {
+    uint64_t fno = f->fd.GetNumber();
+    fno_list.push_back(fno);
+  }
+
+}
+
+void DBImpl::AdjacentFileList(const InternalKey& s, const InternalKey& l, const int level, std::vector<uint64_t>& fno_list){
+
+  auto vstorage = versions_->GetColumnFamilySet()->GetDefault()->current()->storage_info();
+  CompactionInputFiles output_level_inputs;
+  CompactionInputFiles output_level_inputs_2;
+  
+  vstorage->GetOverlappingInputs(level+1, &s, &l, &output_level_inputs.files);
+  
+  if (level != 0) {
+    vstorage->GetOverlappingInputs(level-1, &s, &l, &output_level_inputs_2.files);
+  } else {
+    vstorage->GetOverlappingInputs(0, &s, &l, &output_level_inputs_2.files);
+  }
+  
+  for (const auto& f : output_level_inputs.files) {
+    if (!f->being_compacted){
+      uint64_t fno = f->fd.GetNumber();
+      fno_list.push_back(fno);
+    }
+  }
+ 
+  for (const auto& f : output_level_inputs_2.files) {
+    if (!f->being_compacted) {
+      uint64_t fno = f->fd.GetNumber();
+      fno_list.push_back(fno);
+    }
   }
 }
 

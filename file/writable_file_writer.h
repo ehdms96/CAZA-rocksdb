@@ -312,6 +312,10 @@ class WritableFileWriter {
     assert(sync_without_flush_called_);
     return IOStatus::IOError("Writer has previous error.");
   }
+  void ShouldFlushFullBuffer() { writable_file_->ShouldFlushFullBuffer(); };
+  void SetMinMaxKeyAndLevel(const Slice& s, const Slice& l, const int level) { 
+      writable_file_->SetMinMaxKeyAndLevel(s, l, level); 
+  };
 
  private:
   // Decide the Rate Limiter priority.

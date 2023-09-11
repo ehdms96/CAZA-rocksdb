@@ -300,6 +300,10 @@ ZenFS::~ZenFS() {
   delete zbd_;
 }
 
+void ZenFS::SetDBPointer(DBImpl* db){
+  db_ptr_ = db;
+  zbd_->SetDBPointer(db);
+}
 
 std::string time_in_HH_MM_SS_MMM_l()
 {
@@ -453,6 +457,8 @@ void ZenFS::GCWorker() {
     double elapsed_time = 0;
 
     if (free_percent > GC_START_LEVEL) continue;
+    
+    // std::cout << "free_percent : " << free_percent << " GC_start_level : " << GC_START_LEVEL << " " << std::endl;
 
     auto gc_start = std::chrono::steady_clock::now();
 
@@ -465,16 +471,31 @@ void ZenFS::GCWorker() {
     uint64_t threshold = (100 - GC_SLOPE * (GC_START_LEVEL - free_percent));
     std::set<uint64_t> migrate_zones_start;
     
+    fprintf(stdout, "migrate_zones_start : ");
     for (const auto& zone : snapshot.zones_) {
       if (zone.capacity == 0) {
         uint64_t garbage_percent_approx =
             100 - 100 * zone.used_capacity / zone.max_capacity;
+            
+            // fprintf(stdout, " %ld(%ld/%ld)", garbage_percent_approx, zone.used_capacity, zone.max_capacity);
+
         if (garbage_percent_approx > threshold &&
             garbage_percent_approx < 100) {
           migrate_zones_start.emplace(zone.start);
+
+          fprintf(stdout, "<%ld>", zone.start/2147483648);
         }
       }
     }
+    std::cout << std::endl;
+
+    // if(migrate_zones_start.size() != 0){
+    //   for(auto iter = migrate_zones_start.begin() ; iter != migrate_zones_start.end(); iter++){
+    //     Zone* Logzone = zbd_->id_to_zone_.find((*iter)/2147483648)->second;
+    //     zbd_->PrintVictimInformation(Logzone);
+    //   }
+    //   std::cout << std::endl;
+    // }
 
     std::vector<ZoneExtentSnapshot*> migrate_exts;
     for (auto& ext : snapshot.extents_) {
@@ -548,6 +569,11 @@ void ZenFS::LogFiles() {
   }
   Info(logger_, "Sum of all files: %lu MB of data \n",
        total_size / (1024 * 1024));
+}
+
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
 }
 
 void ZenFS::ClearFiles() {
@@ -764,7 +790,14 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
       if (zoneFile->GetNrLinks() > 0) return s;
       /* Mark up the file as deleted so it won't be migrated by GC */
       zoneFile->SetDeleted();
-      zoneFile.reset();
+      if (ends_with(fname, ".sst")) {
+        zoneFile->ClearExtents();
+      }
+      else{
+        zoneFile.reset();
+      }
+      
+      // fprintf(stdout, "8 is_deleted_ : %d\n", (zoneFile->IsDeleted() == true) ? 1 : 0);
     }
   } else {
     s = target()->DeleteFile(ToAuxPath(fname), options, dbg);
@@ -811,10 +844,10 @@ IOStatus ZenFS::NewRandomAccessFile(const std::string& filename,
   return IOStatus::OK();
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending) {
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
-}
+// inline bool ends_with(std::string const& value, std::string const& ending) {
+//   if (ending.size() > value.size()) return false;
+//   return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+// }
 
 IOStatus ZenFS::NewWritableFile(const std::string& filename,
                                 const FileOptions& file_opts,
@@ -1031,7 +1064,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     }
 
     zoneFile =
-        std::make_shared<ZoneFile>(zbd_, next_file_id_++, &metadata_writer_);
+        std::make_shared<ZoneFile>(zbd_, fname, next_file_id_++, &metadata_writer_);
     zoneFile->SetFileModificationTime(time(0));
     zoneFile->AddLinkName(fname);
 
@@ -1066,7 +1099,7 @@ IOStatus ZenFS::DeleteFile(const std::string& fname, const IOOptions& options,
   IOStatus s;
 
   Debug(logger_, "DeleteFile: %s \n", fname.c_str());
-
+  // fprintf(stdout, "DeleteFile %s\n", fname.c_str());
   files_mtx_.lock();
   s = DeleteFileNoLock(fname, options, dbg);
   files_mtx_.unlock();
@@ -1349,7 +1382,7 @@ void ZenFS::EncodeJson(std::ostream& json_stream) {
 }
 
 Status ZenFS::DecodeFileUpdateFrom(Slice* slice, bool replace) {
-  std::shared_ptr<ZoneFile> update(new ZoneFile(zbd_, 0, &metadata_writer_));
+  std::shared_ptr<ZoneFile> update(new ZoneFile(zbd_, "not_set", 0, &metadata_writer_));
   uint64_t id;
   Status s;
 
@@ -1396,7 +1429,7 @@ Status ZenFS::DecodeSnapshotFrom(Slice* input) {
 
   while (GetLengthPrefixedSlice(input, &slice)) {
     std::shared_ptr<ZoneFile> zoneFile(
-        new ZoneFile(zbd_, 0, &metadata_writer_));
+        new ZoneFile(zbd_, "not_set", 0, &metadata_writer_));
     Status s = zoneFile->DecodeFrom(&slice);
     if (!s.ok()) return s;
 
@@ -2000,8 +2033,7 @@ IOStatus ZenFS::MigrateFileExtents(
     Zone* target_zone = nullptr;
 
     // Allocate a new migration zone.
-    s = zbd_->TakeMigrateZone(&target_zone, zfile->GetWriteLifeTimeHint(),
-                              ext->length_);
+    s = zbd_->TakeMigrateZone(&target_zone, zfile->GetWriteLifeTimeHint(), ext->length_, zfile.get());
     if (!s.ok()) {
       continue;
     }
@@ -2009,8 +2041,11 @@ IOStatus ZenFS::MigrateFileExtents(
     if (target_zone == nullptr) {
       zbd_->ReleaseMigrateZone(target_zone);
       Info(logger_, "Migrate Zone Acquire Failed, Ignore Task.");
+      fprintf(stderr, "Migrate Zone Acquire Failed, Ignore Task.\n");
       continue;
     }
+
+    // zbd_->PrintVictimInformation(target_zone);//Todo.,, after target_zone print할것
 
     uint64_t target_start = target_zone->wp_;
     if (zfile->IsSparse()) {
@@ -2041,6 +2076,7 @@ IOStatus ZenFS::MigrateFileExtents(
   }
 
   SyncFileExtents(zfile.get(), new_extent_list);
+
   zfile->ReleaseWRLock();
 
   Info(logger_, "MigrateFileExtents Finished, fname: %s, extent count: %lu",

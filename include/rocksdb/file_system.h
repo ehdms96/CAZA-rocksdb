@@ -50,6 +50,8 @@ struct MutableDBOptions;
 class RateLimiter;
 struct ConfigOptions;
 
+class DBImpl;
+
 using AccessPattern = RandomAccessFile::AccessPattern;
 using FileAttributes = Env::FileAttributes;
 
@@ -262,11 +264,14 @@ using IOHandleDeleter = std::function<void(void*)>;
 // including data loss, unreported corruption, deadlocks, and more.
 class FileSystem : public Customizable {
  public:
+  DBImpl* db_ptr_;
   FileSystem();
 
   // No copying allowed
   FileSystem(const FileSystem&) = delete;
-
+  virtual void SetDBPointer(DBImpl* db);
+  // virtual int GetZonedFileExtentNum(const uint64_t);
+  // virtual void GetExtentInfo(const uint64_t, const int, int&, uint32_t&, uint32_t&);
   virtual ~FileSystem();
 
   static const char* Type() { return "FileSystem"; }
@@ -956,6 +961,14 @@ class FSWritableFile {
         strict_bytes_per_sync_(options.strict_bytes_per_sync) {}
 
   virtual ~FSWritableFile() {}
+  virtual void ShouldFlushFullBuffer() {}; 
+  virtual void SetMinMaxKeyAndLevel(const Slice& s, const Slice& l, const int level) {
+      Slice a=s; 
+      Slice m=l;
+      a = m;
+      int c = level;
+      c++;
+  };
 
   // Append data to the end of the file
   // Note: A WritableFile object must support either Append or
