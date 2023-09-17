@@ -258,6 +258,7 @@ class ZonedBlockDevice {
   std::mutex sst_zone_mtx_;
   std::map<uint64_t, std::shared_ptr<ZoneFile>> files_;
   std::mutex files_mtx_;
+  std::mutex zone_cleaning_mtx;
 
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
@@ -332,6 +333,7 @@ class ZonedBlockDevice {
   IOStatus GetBestOpenZoneMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, Zone **zone_out, uint32_t min_capacity = 0);
   
   IOStatus GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime, unsigned int *best_diff_out, int *new_out, Zone **out_zone, InternalKey smallest, InternalKey largest, int level, uint32_t min_capacity = 0);
+  IOStatus findOverlappedSST(std::vector<Zone*>& candidates, std::vector<uint64_t>& fno_list, Zone **zone_out, uint32_t min_capacity);
   IOStatus AllocateMostL0Files(const std::set<int>&, Zone **zone_out,  uint32_t min_capacity);
   Zone * AllocateZoneWithSameLevelFiles(const std::vector<uint64_t>&, const InternalKey, const InternalKey, uint32_t min_capacity);
   void SameLevelFileList(const int, std::vector<uint64_t>&); 

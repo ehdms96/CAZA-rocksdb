@@ -247,7 +247,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
 
   return Status::OK();
 }
-
+    
 ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename, uint64_t file_id,
                    MetadataWriter* metadata_writer)
     : zbd_(zbd),
@@ -292,7 +292,7 @@ void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
 ZoneFile::~ZoneFile() { ClearExtents(); }
 
 void ZoneFile::ClearExtents() {
-  // zbd_->zone_cleaning_mtx.lock();
+  zbd_->zone_cleaning_mtx.lock();
   if (is_sst_) {
     zbd_->sst_zone_mtx_.lock();
     
@@ -309,7 +309,6 @@ void ZoneFile::ClearExtents() {
     }
     zbd_->files_mtx_.unlock();
   }
-
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
@@ -318,8 +317,9 @@ void ZoneFile::ClearExtents() {
     zone->Invalidate(*e);
     delete *e;
   }
-  // zbd_->zone_cleaning_mtx.unlock();
+  zbd_->zone_cleaning_mtx.unlock();
   extents_.clear();
+
 }
 
 IOStatus ZoneFile::CloseActiveZone() {

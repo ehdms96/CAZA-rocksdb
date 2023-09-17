@@ -18,7 +18,7 @@ endif
 
 CXXFLAGS +=  $(EXTRA_CXXFLAGS)
 LDFLAGS +=  $(EXTRA_LDFLAGS)
-LDFLAGS += -lzbd
+LDFLAGS += -lzbd -I/home/doeun96/CAZA -I/home/doeun96/CAZA/rocksdb/
 
 all: $(TARGET) $(TARGET).dbg
 

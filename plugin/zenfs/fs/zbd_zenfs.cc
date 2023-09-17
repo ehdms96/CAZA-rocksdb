@@ -30,7 +30,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <semaphore>
+#include <semaphore.h>
 #include <iostream>
 
 #include "rocksdb/env.h"
@@ -183,7 +183,7 @@ void Zone::Invalidate(ZoneExtent* extent) {
     }
   }
   if (!found) {
-    // fprintf(stderr, "Failed to Find extent in the zone\n");
+    fprintf(stderr, "Failed to Find extent in the zone\n");
   }
 }
 
@@ -529,11 +529,9 @@ ZonedBlockDevice::~ZonedBlockDevice() {
   for (const auto z : meta_zones) {
     delete z;
   }
-
   for (const auto z : io_zones) {
     delete z;
   }
-
   id_to_zone_.clear();
 }
 
@@ -590,6 +588,18 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
     if (z->Acquire()) {
       if (!z->IsEmpty() && !z->IsUsed()) {
         bool full = z->IsFull();
+        bool all_invalid = true;
+
+        for (auto exinfo : z->extent_info_) {
+          if (exinfo->valid_ == true) {
+            all_invalid = false;
+          }
+        }
+
+        if(!all_invalid){
+          assert(all_invalid); // ??
+        }
+        
         IOStatus reset_status = z->Reset();
         IOStatus release_status = z->CheckRelease();
         if (!reset_status.ok()) return reset_status;
@@ -871,8 +881,9 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       if (!candidates.empty()) {
         /* There is at least one zone having free space */
         // If there's more than one zone, pick the zone with most data with overlapped SST
-        uint64_t overlapped_data = 0;
-        uint64_t alloc_inval_data = 0;
+        s = findOverlappedSST(candidates, fno_list, &allocated_zone, min_capacity);
+        if (!s.ok()) return s;
+        /*
         for (const auto z : candidates) {
           uint64_t data_amount = 0;
           uint64_t inval_data = 0;
@@ -896,19 +907,15 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
               alloc_inval_data = inval_data;
             }
           }
-
-          // TODO changed.
-          // if(z->Acquire()){ // if not busy 
-
-          // }
         }
+        */
       }
 
-      if(allocated_zone != nullptr){
-        while (!allocated_zone->Acquire());
-      }
+      // if(allocated_zone != nullptr){
+      //   std::cout << "findOverlappedSST get zone id : " << allocated_zone->zone_id_ << std::endl;
+      // }
     } // if (!fno_list.empty())
-    else if (fno_list.empty() && (level==0 || level==100 )) {
+    else if (fno_list.empty() && (level==0 || level==100)) {
       /* (1) There is no matching files being overlapped with current file
         ->(TODO)Find the file within the same level which has smallest key diff*/
       std::set<int> zone_list;
@@ -993,6 +1000,89 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
   *zone_out = allocated_zone;
 
   // io_zones_mtx.unlock();
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::findOverlappedSST(std::vector<Zone*>& candidates, std::vector<uint64_t>& fno_list, Zone **zone_out, uint32_t min_capacity){
+  // std::cout << "findOverlappedSST" << std::endl;
+
+  IOStatus s;
+  Zone *allocated_zone = nullptr;
+
+  uint64_t overlapped_data = 0;
+  uint64_t alloc_inval_data = 0;
+
+  for (const auto z : candidates) {
+    uint64_t data_amount = 0;
+    uint64_t inval_data = 0;
+    for (const auto ext : z->extent_info_) {
+      
+      if (z->Acquire()) { // if not busy 
+        if (!ext->valid_) {
+          inval_data += ext->length_;
+        } 
+        else if (ext->valid_ && ext->zone_file_->is_sst_) {
+          uint64_t cur_fno = ext->zone_file_->fno_;
+          for (uint64_t fno : fno_list) {
+              if (cur_fno == fno ) {
+                data_amount += ext->length_; 
+              }
+          }
+        }
+
+        if (data_amount > overlapped_data && z->capacity_ >= min_capacity) {
+          if (allocated_zone != nullptr) { // if not first
+            s = allocated_zone->CheckRelease(); // release previous allocated zone
+            if (!s.ok()) {
+              IOStatus s_ = z->CheckRelease();
+              if (!s_.ok()) return s_;
+              return s;
+            }
+          }
+          allocated_zone = z;
+          alloc_inval_data = inval_data;
+        } 
+        else if ((data_amount == overlapped_data) && (alloc_inval_data > inval_data) && z->capacity_ >= min_capacity) {
+          if (allocated_zone != nullptr) { // if not first
+            s = allocated_zone->CheckRelease(); // release previous allocated zone
+            if (!s.ok()) {
+              IOStatus s_ = z->CheckRelease();
+              if (!s_.ok()) return s_;
+              return s;
+            }
+          }
+          allocated_zone = z;
+          alloc_inval_data = inval_data;
+        }
+        else{
+          s = z->CheckRelease();
+          if (!s.ok()) return s;
+        }
+      }
+      /*
+      if (!ext->valid_) {
+        inval_data += ext->length_;
+      } else if (ext->valid_ && ext->zone_file_->is_sst_) {
+        uint64_t cur_fno = ext->zone_file_->fno_;
+        for (uint64_t fno : fno_list) {
+            if (cur_fno == fno ) {
+              data_amount += ext->length_; 
+            }
+        }
+      }
+      if (data_amount > overlapped_data && !z->IsBusy() && z->capacity_ >= min_capacity) {
+        allocated_zone = z;
+        alloc_inval_data = inval_data;
+      } 
+      else if ((data_amount == overlapped_data) && (alloc_inval_data > inval_data) && !z->IsBusy() && z->capacity_ >= min_capacity) {
+        allocated_zone = z;
+        alloc_inval_data = inval_data;
+      }
+      */
+    }
+  }
+  
+  *zone_out = allocated_zone;
   return IOStatus::OK();
 }
 
@@ -1276,6 +1366,7 @@ IOStatus ZonedBlockDevice::ReleaseMigrateZone(Zone *zone) {
 }
 
 IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint file_lifetime, uint32_t min_capacity, ZoneFile* zoneFile) {
+  
   std::unique_lock<std::mutex> lock(migrate_zone_mtx_);
   migrate_resource_.wait(lock, [this] { return !migrating_; });
 

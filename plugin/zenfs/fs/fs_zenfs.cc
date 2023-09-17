@@ -297,7 +297,7 @@ ZenFS::~ZenFS() {
 
   meta_log_.reset(nullptr);
   ClearFiles();
-  delete zbd_;
+  // delete zbd_;
 }
 
 void ZenFS::SetDBPointer(DBImpl* db){
@@ -792,12 +792,11 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
       zoneFile->SetDeleted();
       if (ends_with(fname, ".sst")) {
         zoneFile->ClearExtents();
+        // zoneFile.reset();
       }
       else{
         zoneFile.reset();
       }
-      
-      // fprintf(stdout, "8 is_deleted_ : %d\n", (zoneFile->IsDeleted() == true) ? 1 : 0);
     }
   } else {
     s = target()->DeleteFile(ToAuxPath(fname), options, dbg);
@@ -1099,13 +1098,11 @@ IOStatus ZenFS::DeleteFile(const std::string& fname, const IOOptions& options,
   IOStatus s;
 
   Debug(logger_, "DeleteFile: %s \n", fname.c_str());
-  // fprintf(stdout, "DeleteFile %s\n", fname.c_str());
   files_mtx_.lock();
   s = DeleteFileNoLock(fname, options, dbg);
   files_mtx_.unlock();
   if (s.ok()) s = zbd_->ResetUnusedIOZones();
   zbd_->LogZoneStats();
-
   return s;
 }
 
@@ -1993,6 +1990,7 @@ IOStatus ZenFS::MigrateExtents(
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
     const std::vector<ZoneExtentSnapshot*>& migrate_exts) {
+
   IOStatus s = IOStatus::OK();
   Info(logger_, "MigrateFileExtents, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
@@ -2012,10 +2010,10 @@ IOStatus ZenFS::MigrateFileExtents(
   std::vector<ZoneExtent*> new_extent_list;
   std::vector<ZoneExtent*> extents = zfile->GetExtents();
   for (const auto* ext : extents) {
-    new_extent_list.push_back(
-        new ZoneExtent(ext->start_, ext->length_, ext->zone_));
+    ZoneExtent* new_extent = new ZoneExtent(ext->start_, ext->length_, ext->zone_);
+    new_extent_list.push_back(new_extent);
   }
-
+  // zbd_->zone_cleaning_mtx.lock(); //deadlock??
   // Modify the new extent list
   for (ZoneExtent* ext : new_extent_list) {
     // Check if current extent need to be migrated
@@ -2044,7 +2042,7 @@ IOStatus ZenFS::MigrateFileExtents(
       fprintf(stderr, "Migrate Zone Acquire Failed, Ignore Task.\n");
       continue;
     }
-
+    
     // zbd_->PrintVictimInformation(target_zone);//Todo.,, after target_zone print할것
 
     uint64_t target_start = target_zone->wp_;
@@ -2068,9 +2066,26 @@ IOStatus ZenFS::MigrateFileExtents(
       break;
     }
 
+    zbd_->sst_zone_mtx_.lock();
+    if (zfile->is_sst_) { 
+      std::vector<int> fz = zbd_->sst_to_zone_[zfile->fno_];
+      for (auto itt = fz.begin(); itt != fz.end(); itt++) {
+          if (*itt == ext->zone_->zone_id_ ) {
+            fz.erase(itt);
+            break;
+          } 
+      }
+      zbd_->sst_to_zone_[zfile->fno_].push_back(target_zone->zone_id_);
+    }
+    zbd_->sst_zone_mtx_.unlock();
+
     ext->start_ = target_start;
     ext->zone_ = target_zone;
     ext->zone_->used_capacity_ += ext->length_;
+
+    ZoneExtent * new_extent = new ZoneExtent(target_start, ext->length_, target_zone);
+    ZoneExtentInfo * new_extent_info = new ZoneExtentInfo(new_extent, zfile.get() ,true, new_extent->length_, new_extent->start_, new_extent->zone_, zfile->GetFilename(), zfile->GetWriteLifeTimeHint(), zfile->level_);
+    target_zone->PushExtentInfo(new_extent_info);
 
     zbd_->ReleaseMigrateZone(target_zone);
   }
@@ -2081,6 +2096,8 @@ IOStatus ZenFS::MigrateFileExtents(
 
   Info(logger_, "MigrateFileExtents Finished, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
+
+  // zbd_->zone_cleaning_mtx.unlock();
   return IOStatus::OK();
 }
 

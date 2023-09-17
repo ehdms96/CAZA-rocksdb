@@ -179,7 +179,7 @@ class ZenFS : public FileSystemWrapper {
 
   void SetDBPointer(DBImpl* db);
   // int GetZonedFileExtentNum(const uint64_t fileno);
-  void GetExtentInfo(const uint64_t fileno, const int ext_no, int& zone_id, uint32_t& extent_length, uint32_t& extent_start); 
+  // void GetExtentInfo(const uint64_t fileno, const int ext_no, int& zone_id, uint32_t& extent_length, uint32_t& extent_start); 
   void LogFiles();
   void ClearFiles();
   std::string FormatPathLexically(fs::path filepath);
