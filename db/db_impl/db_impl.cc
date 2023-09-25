@@ -322,9 +322,11 @@ void DBImpl::SameLevelFileList(const int level, std::vector<uint64_t>& fno_list)
 
   auto files = vstorage->LevelFiles(level);
   
-  for (const auto f : files) {
-    uint64_t fno = f->fd.GetNumber();
-    fno_list.push_back(fno);
+  if(files.size() != 0){
+    for (const auto f : files) {
+      uint64_t fno = f->fd.GetNumber();
+      fno_list.push_back(fno);
+    }
   }
 
 }

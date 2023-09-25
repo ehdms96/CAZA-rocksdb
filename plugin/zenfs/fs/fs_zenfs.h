@@ -156,6 +156,9 @@ class ZenFS : public FileSystemWrapper {
   bool run_DZA_worker_ = true;
   
   std::uint64_t total_copied_data_size = 0;
+  std::uint64_t total_copied_data_size2 = 0;
+  std::uint64_t total_GC_count = 0;
+  std::uint64_t total_vcitimzone_num = 0;
   double total_elapsed_time = 0;
 
   struct ZenFSMetadataWriter : public MetadataWriter {

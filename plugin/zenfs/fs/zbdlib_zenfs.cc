@@ -101,10 +101,17 @@ IOStatus ZbdlibBackend::Open(bool readonly, bool exclusive,
   IOStatus ios = CheckScheduler();
   if (ios != IOStatus::OK()) return ios;
 
+  struct zbd_zone z;
+  unsigned int report = 1;
+  
   block_sz_ = info.pblock_size;
   zone_sz_ = info.zone_size;
   nr_zones_ = info.nr_zones;
   //nr_zones_ = 240; // filesystem size
+
+  zbd_report_zones(read_f_, 0, zone_sz_, ZBD_RO_ALL, &z, &report); // jy
+  zone_capacity_ = zbd_zone_capacity(&z);
+
   *max_active_zones = info.max_nr_active_zones;
   *max_open_zones = info.max_nr_open_zones;
   return IOStatus::OK();

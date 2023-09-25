@@ -119,8 +119,10 @@ class ZoneFile {
   bool is_sst_; //CZ
   uint64_t fno_; //CZ
 
-  std::atomic<bool> extent_writer;
+  std::mutex extent_mtx_; //CZ
+  std::atomic<bool> extent_writer; //CZ //CZ
   std::atomic<unsigned int> extent_reader;
+  std::condition_variable extent_cv; //CZ
 
   IOStatus FullBuffer(void*, int, int);
   
@@ -165,11 +167,11 @@ class ZoneFile {
   void PushExtent();
   IOStatus AllocateNewZone();
 
-  void ExtentReadLock();
-  void ExtentReadUnlock();
+  void ExtentReadLock(); //CZ
+  void ExtentReadUnlock(); //CZ
 
-  void ExtentWriteLock();
-  void ExtentWriteUnlock();
+  void ExtentWriteLock(); //CZ
+  void ExtentWriteUnlock(); //CZ
 
   void EncodeTo(std::string* output, uint32_t extent_start);
   void EncodeUpdateTo(std::string* output) {

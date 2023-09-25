@@ -280,7 +280,8 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename, uint64_t file_id
 
 std::string ZoneFile::GetFilename() { 
   assert(filename_ == linkfiles_[0]);
-  return linkfiles_[0]; 
+  return filename_; 
+  // return linkfiles_[0]; 
 }
 time_t ZoneFile::GetFileModificationTime() { return m_time_; }
 
@@ -293,6 +294,7 @@ ZoneFile::~ZoneFile() { ClearExtents(); }
 
 void ZoneFile::ClearExtents() {
   zbd_->zone_cleaning_mtx.lock();
+
   if (is_sst_) {
     zbd_->sst_zone_mtx_.lock();
     
@@ -314,7 +316,7 @@ void ZoneFile::ClearExtents() {
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
-    zone->Invalidate(*e);
+    zone->Invalidate(*e, this);
     delete *e;
   }
   zbd_->zone_cleaning_mtx.unlock();
@@ -495,7 +497,7 @@ void ZoneFile::PushExtent() {
   if (length == 0) return;
 
   assert(length <= (active_zone_->wp_ - extent_start_));
-
+  
   ZoneExtent * new_extent = new ZoneExtent(extent_start_, length, active_zone_); 
   extents_.push_back(new_extent);
   //(ZC) Add inforamtion about currently written extent into the Zone. So that make it easier to track validity of the extents in zone in processing Zone Cleaning
@@ -511,12 +513,53 @@ void ZoneFile::PushExtent() {
     }
     zbd_->sst_zone_mtx_.unlock();
   }
-  // fprintf(stdout, "PushExtentInfo this->level_ : %d\n", this->level_);
+  
   active_zone_->PushExtentInfo(new ZoneExtentInfo(new_extent, this, true, length, new_extent->start_, new_extent->zone_, this->GetFilename(), this->lifetime_, this->level_));
 
   active_zone_->used_capacity_ += length;
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
+}
+
+void ZoneFile::ExtentReadLock(){
+ std::unique_lock<std::mutex> lk(extent_mtx_);
+ while (extent_writer.load()){
+     extent_cv.wait(lk, [this]{
+      if (extent_writer.load() == true) {
+        return false;
+      } else {
+        return true;
+      }
+    });
+ }
+ extent_reader++;
+}
+
+void ZoneFile::ExtentReadUnlock(){
+ std::unique_lock<std::mutex> lk(extent_mtx_);
+ extent_reader--;
+ if (extent_reader.load() == 0)
+    extent_cv.notify_all();
+}
+
+void ZoneFile::ExtentWriteLock(){
+ std::unique_lock<std::mutex> lk(extent_mtx_);
+ while (extent_writer.load() || extent_reader.load() > 0 ){
+    extent_cv.wait(lk, [this]{
+      if (extent_writer.load() || extent_reader.load() > 0) {
+         return false;
+      } else {
+        return true;
+      }
+    });
+ }
+ extent_writer.store(true);
+}
+
+void ZoneFile::ExtentWriteUnlock(){
+ std::unique_lock<std::mutex> lk(extent_mtx_);
+ extent_writer.store(false);
+ extent_cv.notify_one();
 }
 
 IOStatus ZoneFile::AllocateNewZone() {
@@ -525,6 +568,9 @@ IOStatus ZoneFile::AllocateNewZone() {
   // std::cout << "ZoneFile::AllocateNewZone() zoneFile name : " << GetFilename() << " ";
   // fprintf(stdout, "ZoneFile::AllocateNewZone() this->level_ : %d, level : %d\n", this->level_, level_);
 
+  while(zbd_->zone_gc_doing){
+
+  }
   IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone, this);
 
   if (!s.ok()) return s;
@@ -571,8 +617,11 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) { //orizin z
     s = active_zone_->Append(buffer, wr_size + pad_sz);
     if (!s.ok()) return s;
 
-    extents_.push_back(
-        new ZoneExtent(extent_start_, extent_length, active_zone_));
+    // extents_.push_back(new ZoneExtent(extent_start_, extent_length, active_zone_));
+    // std::cout << GetFilename() << " BufferedAppend ERROR PUSH EXTENTINFO NOTHING \n";
+    ZoneExtent * new_extent = new ZoneExtent(extent_start_, extent_length, active_zone_);
+    extents_.push_back(new_extent);
+    // active_zone_->PushExtentInfo(new ZoneExtentInfo(new_extent, this, true, new_extent->length_, new_extent->start_, new_extent->zone_, filename_, this->lifetime_, this->level_));
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
@@ -637,6 +686,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
     extents_.push_back(
         new ZoneExtent(extent_start_ + ZoneFile::SPARSE_HEADER_SIZE,
                        extent_length, active_zone_));
+    std::cout << GetFilename() << " SparseAppend ERROR PUSH EXTENTINFO NOTHING \n";
 
     extent_start_ = active_zone_->wp_;
     active_zone_->used_capacity_ += extent_length;
@@ -863,6 +913,7 @@ IOStatus ZoneFile::RecoverSparseExtents(uint64_t start, uint64_t end,
     zone->used_capacity_ += extent_length;
     extents_.push_back(new ZoneExtent(next_extent_start + SPARSE_HEADER_SIZE,
                                       extent_length, zone));
+    std::cout << GetFilename() << " RecoverSparseExtents ERROR PUSH EXTENTINFO NOTHING \n";
 
     uint64_t extent_blocks = (extent_length + SPARSE_HEADER_SIZE) / block_sz;
     if ((extent_length + SPARSE_HEADER_SIZE) % block_sz) {
@@ -911,6 +962,7 @@ IOStatus ZoneFile::Recover() {
        any missing data using the WP */
     zone->used_capacity_ += to_recover;
     extents_.push_back(new ZoneExtent(extent_start_, to_recover, zone));
+    std::cout << GetFilename() << " Recover ERROR PUSH EXTENTINFO NOTHING \n";
   }
 
   /* Mark up the file as having no missing extents */

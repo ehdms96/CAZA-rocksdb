@@ -152,6 +152,7 @@ IOStatus Zone::Append(char *data, uint32_t size) {
     ret = zbd_be_->Write(ptr, left, wp_);
     
     if (ret < 0) {
+      fprintf(stdout, "Zone<%d>::Append ret -1!!!! active zone limit? \n", zone_id_);
       return IOStatus::IOError(strerror(errno));
     }
 
@@ -165,7 +166,12 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   return IOStatus::OK();
 }
 
-void Zone::Invalidate(ZoneExtent* extent) {
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+}
+
+void Zone::Invalidate(ZoneExtent* extent, ZoneFile* zoneFile) {
 
   bool found = false;
   if (extent == nullptr) {
@@ -173,6 +179,7 @@ void Zone::Invalidate(ZoneExtent* extent) {
   }
   for(const auto ex : extent_info_) {
     if(ex->valid_){
+        // if (ex->fname_ == zoneFile->GetFilename()) {
         if (ex->extent_ == extent) {
           if (found) {
             fprintf(stderr, "Duplicate Extent in Invalidate (%p == %p)\n", ex->extent_, extent);
@@ -183,8 +190,47 @@ void Zone::Invalidate(ZoneExtent* extent) {
     }
   }
   if (!found) {
-    fprintf(stderr, "Failed to Find extent in the zone\n");
+    // fprintf(stderr, "Failed to Find extent in the zone <%d> \n", zone_id_);
+    if(ends_with(zoneFile->GetFilename(), ".sst")){
+      std::cerr << "ClearExtents ZoneFile name : " << zoneFile->GetFilename() << std::endl;
+      std::cerr << "Failed to Find extent in the zone <" << zone_id_ << ">" << std::endl;
+      std::cerr << "Extent start_ " << extent->start_ << std::endl;
+      std::cerr << "Extent length_ " << extent->length_ << std::endl;
+      std::cerr << "Extent Addrr " << extent << std::endl;
+      
+      zbd_->PrintVictimInformation(this);
+      // tracking_where_realExtentInfo(extent, zoneFile);
+    }
   }
+}
+
+//find update된 extentInfo는 어디에 있는것인가 찾기
+void Zone::tracking_where_realExtentInfo(ZoneExtent* extent, ZoneFile* zoneFile) {
+  std::cout << "tracking_where_realExtentInfo start" << std::endl;
+  ZoneExtent* s_extent = nullptr;
+
+  bool found = false;
+  auto io_zones_list = zoneFile->GetZbd()->GetIOZones();
+
+  for(auto zone : io_zones_list){
+    for(const auto ex : zone->extent_info_) {
+      if(ex->valid_){
+        if (ex->extent_ == extent) {
+          s_extent = ex->extent_;
+          found = true;
+        }
+      }
+    }
+  }
+
+  if (found) {
+    std::cout << "Find extent in the zone <" << zone_id_ << ">" << std::endl;
+    std::cout << "Extent Addrr " << extent << std::endl;
+    std::cout << "Extent Addrr " << s_extent << std::endl;
+  }
+
+  std::cout << "tracking_where_realExtentInfo done" << std::endl;
+
 }
 
 inline IOStatus Zone::CheckRelease() {
@@ -446,6 +492,18 @@ uint64_t ZonedBlockDevice::GetReclaimableSpace() {
   return reclaimable;
 }
 
+uint64_t ZonedBlockDevice::GetLastZoneNum() {
+  uint64_t last = 0;
+  for (auto it = io_zones.rbegin() ; it != io_zones.rend(); ++it) {
+    Zone * z = *it;
+    if(z->IsFull() || z->IsUsed() || !z->IsEmpty()){
+      last = z->GetIOZoneID();
+      break;
+    } 
+  }
+  return last;
+}
+
 void ZonedBlockDevice::LogZoneStats() {
   uint64_t used_capacity = 0;
   uint64_t reclaimable_capacity = 0;
@@ -535,6 +593,33 @@ ZonedBlockDevice::~ZonedBlockDevice() {
   id_to_zone_.clear();
 }
 
+uint64_t ZonedBlockDevice::GetZoneCapacity() {
+  return zbd_be_->zone_capacity_;
+}
+
+void ZonedBlockDevice::ZoneUtilization() {
+  uint32_t occupied = 0;
+  int zone_capacity = GetZoneCapacity();
+
+  // fprintf(stdout, "---------------------------------\n");
+  // fprintf(stdout, "zone capacity : %d\n", zone_capacity);
+
+  // fprintf(stdout, "ZIDX VALID UTIL\n");
+  int zidx = 3; // io zones start from zone index 3
+  for (const auto zone : io_zones) {
+    if (!zone->IsEmpty()) {
+      uint64_t valid = zone->used_capacity_;
+      double util = (double)valid / (double)zone_capacity;
+
+      // fprintf(stdout, "idx : %d valid data : %lu zone cap : %u util : %lf\n", idx, valid, zone_capacity, util);
+      fprintf(stdout, "%d %lu %lf\n", zidx, valid, util);
+      occupied += 1;
+    }
+    zidx += 1;  
+  }
+  fprintf(stdout, "# of occupied zones : %u\n", occupied);
+}
+
 #define LIFETIME_DIFF_NOT_GOOD (100)
 #define LIFETIME_DIFF_COULD_BE_WORSE (50)
 
@@ -584,6 +669,7 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
 }
 
 IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
+  // fprintf(stdout, "ResetUnusedIOZones zone : ");
   for (const auto z : io_zones) {
     if (z->Acquire()) {
       if (!z->IsEmpty() && !z->IsUsed()) {
@@ -599,7 +685,7 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
         if(!all_invalid){
           assert(all_invalid); // ??
         }
-        
+        // fprintf(stdout, "<%ld> ", z->start_/2147483648);
         IOStatus reset_status = z->Reset();
         IOStatus release_status = z->CheckRelease();
         if (!reset_status.ok()) return reset_status;
@@ -611,6 +697,7 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
       }
     }
   }
+  // std::cout << std::endl;
   return IOStatus::OK();
 }
 
@@ -675,29 +762,6 @@ IOStatus ZonedBlockDevice::ApplyFinishThreshold() {
 
   for (const auto z : io_zones) {
     if (z->Acquire()) {
-      
-      // if (!z->IsEmpty() && !z->IsUsed())  {
-      //   bool full = z->IsFull();
-      //   bool all_invalid = true;
-        
-      //   for (auto exinfo : z->extent_info_) {
-      //     if (exinfo->valid_ == true) {
-      //       all_invalid = false;
-      //     }
-      //   }
-      //   if(!all_invalid){
-      //     assert(all_invalid);
-      //   }
-        
-      //   IOStatus reset_status = z->Reset();
-      //   IOStatus release_status = z->CheckRelease();
-      //   if (!reset_status.ok()) return reset_status;
-      //   if (!release_status.ok()) return release_status;
-      //   if (!full) PutActiveIOZoneToken();
-        
-      //   continue;
-      // }
-
       bool within_finish_threshold =
           z->capacity_ < (z->max_capacity_ * finish_threshold_ / 100);
       if (!(z->IsEmpty() || z->IsFull()) && within_finish_threshold) {
@@ -817,7 +881,7 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
   Zone *allocated_zone = nullptr;
   int new_zone = 0;
   IOStatus s;
-  // io_zones_mtx.lock();
+  
   
   if(sst_to_zone_.empty()){
     if(GetActiveIOZoneTokenIfAvailable()){
@@ -831,18 +895,25 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       if (allocated_zone != nullptr) {
         assert(allocated_zone->IsBusy());
         allocated_zone->lifetime_ = file_lifetime;
+        allocated_zone->min_lifetime_ = file_lifetime;
         new_zone = true;
       } else {
         PutActiveIOZoneToken();
       }
     }
 
-    if(allocated_zone != nullptr){
-      // fprintf(stdout, "\t\t\t emptyzone ");
-    }
+    // if(allocated_zone != nullptr){
+    //   std::cout << "\t\t\t emptyzone get zone id : " << allocated_zone->zone_id_ << std::endl;
+    // }
   } else { // sst_to_zone is not empty!
+    // std::cout << "<sst_to_zone_ [first] vector >" << std::endl;
     // for(auto iter = sst_to_zone_.begin() ; iter != sst_to_zone_.end(); iter++){
-    // 	std::cout << iter->first << " " ;
+    // 	std::cout << "[" << iter->first << "] " ;
+    //   std::vector<int> frint = sst_to_zone_[iter->first];
+    //   for(int j=0; j < int(frint.size()); j++){
+    //     std::cout << frint[int(j)] << " ";
+    //   }
+    //   std::cout << std::endl; 
     // }
     // std::cout << std::endl; 
 
@@ -881,38 +952,13 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       if (!candidates.empty()) {
         /* There is at least one zone having free space */
         // If there's more than one zone, pick the zone with most data with overlapped SST
+
         s = findOverlappedSST(candidates, fno_list, &allocated_zone, min_capacity);
         if (!s.ok()) return s;
-        /*
-        for (const auto z : candidates) {
-          uint64_t data_amount = 0;
-          uint64_t inval_data = 0;
-          for (const auto ext : z->extent_info_) {
-            if (!ext->valid_) {
-              inval_data += ext->length_;
-            } else if (ext->valid_ && ext->zone_file_->is_sst_) {
-              uint64_t cur_fno = ext->zone_file_->fno_;
-              for (uint64_t fno : fno_list) {
-                  if (cur_fno == fno ) {
-                    data_amount += ext->length_; 
-                  }
-              }
-            }
-            if (data_amount > overlapped_data && !z->IsBusy() && z->capacity_ >= min_capacity) {
-              allocated_zone = z;
-              alloc_inval_data = inval_data;
-            } 
-            else if ((data_amount == overlapped_data) && (alloc_inval_data > inval_data) && !z->IsBusy() && z->capacity_ >= min_capacity) {
-              allocated_zone = z;
-              alloc_inval_data = inval_data;
-            }
-          }
-        }
-        */
       }
 
       // if(allocated_zone != nullptr){
-      //   std::cout << "findOverlappedSST get zone id : " << allocated_zone->zone_id_ << std::endl;
+      //   std::cout << "\t\t\t findOverlappedSST get zone id : " << allocated_zone->zone_id_ << std::endl;
       // }
     } // if (!fno_list.empty())
     else if (fno_list.empty() && (level==0 || level==100)) {
@@ -944,6 +990,10 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       //Allocate Zones with most the number of L0 files
       s = AllocateMostL0Files(zone_list, &allocated_zone, min_capacity);
       if (!s.ok()) return s;
+
+      // if(allocated_zone != nullptr){
+      //   std::cout << "\t\t\t AllocateMostL0Files get zone id : " << allocated_zone->zone_id_ << std::endl;
+      // }
     }
 
     if(!allocated_zone){
@@ -957,31 +1007,34 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
         if (allocated_zone != nullptr) {
           assert(allocated_zone->IsBusy());
           allocated_zone->lifetime_ = file_lifetime;
+          allocated_zone->min_lifetime_ = file_lifetime;
           new_zone = true;
         } else {
           PutActiveIOZoneToken();
         }
-        if(allocated_zone != nullptr){
-          // fprintf(stdout, "\t\t\t (emptyzone) ");
-        }
+
+        // if(allocated_zone != nullptr){
+        //   std::cout << "\t\t\t (emptyzone) get zone id : " << allocated_zone->zone_id_ << std::endl;
+        // }
       }
     }
 
-    if(!allocated_zone){
+    if(!allocated_zone && level!=100 ){
       SameLevelFileList(level, fno_list);
       // std::cout << "fno_list size4 : " << fno_list.size() << std::endl;
       allocated_zone = AllocateZoneWithSameLevelFiles(fno_list, smallest, largest, min_capacity);
 
       if(allocated_zone != nullptr){
         while (!allocated_zone->Acquire());
+        // std::cout << "\t\t\t AllocateZoneWithSameLevelFiles get zone id : " << allocated_zone->zone_id_ << std::endl;
       }
     }
   }
 
 
-  if(allocated_zone != nullptr && !new_zone){
-    // fprintf(stdout, "\t\t\t caza ");
-  }
+  // if(allocated_zone != nullptr && !new_zone){
+  //   fprintf(stdout, "\t\t\t caza ");
+  // }
   
   if(!allocated_zone){
     // fprintf(stdout, "Try to fill an already open zone!\n");
@@ -990,16 +1043,16 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       PutOpenIOZoneToken(); //Giving it up 
       return s;
     }
-    if(allocated_zone != nullptr){
-      // fprintf(stdout, "\t\t\t alreadyOpen ");
-    }
+    // if(allocated_zone != nullptr){
+    //   std::cout << "\t\t\t alreadyOpen get zone id : " << allocated_zone->zone_id_ << std::endl;
+    // }
   }
 
   *best_diff_out = best_diff;
   *new_out = new_zone;
   *zone_out = allocated_zone;
 
-  // io_zones_mtx.unlock();
+  
   return IOStatus::OK();
 }
 
@@ -1210,18 +1263,6 @@ IOStatus ZonedBlockDevice::AllocateMostL0Files(const std::set<int>& zone_list, Z
   for (const auto z_id : zone_list) {
     Zone* zone = id_to_zone_.find(z_id)->second;
     uint64_t length = 0;
-    
-    // if (!zone->IsBusy() && !zone->IsFull() && zone->capacity_ >= min_capacity) {
-    //   for (const auto& ext : zone->extent_info_) {
-    //     if (ext->level_ == 0 && ext->valid_) {
-    //         length += ext->length_;    
-    //     }
-    //   }
-    //   if (length >= max){ 
-    //     max = length;
-    //     z = zone;
-    //   }
-    // }
 
     if (zone->Acquire()) { // if not busy 
       if ((zone->used_capacity_ > 0) && !zone->IsFull() && zone->capacity_ >= min_capacity) {
@@ -1385,7 +1426,7 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHi
 
   if (s.ok() && (*out_zone) != nullptr) {
     Info(logger_, "TakeMigrateZone: %lu", (*out_zone)->start_);
-    fprintf(stdout, "TakeMigrateZone GetBestCAZAMatch outzone: %lu\n", (*out_zone)->start_/2147483648);
+    // fprintf(stdout, "TakeMigrateZone GetBestCAZAMatch outzone: %lu\n", (*out_zone)->start_/2147483648);
   } else {
     migrating_ = false;
   }
@@ -1505,27 +1546,13 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
     std::cout << "zoneFile name : " << zoneFile->GetFilename() << std::endl;
 */
 
-    // if(sst_to_zone_.empty()){
-    //   if(GetActiveIOZoneTokenIfAvailable()){
-    //     s = AllocateEmptyZone(&allocated_zone);
-    //     if (!s.ok()) {
-    //       PutActiveIOZoneToken();
-    //       PutOpenIOZoneToken();
-    //       return s;
-    //     }
+    uint64_t start = 0;
+    uint64_t elapsed = 0;
+    if (file_lifetime > 2) {
+      start = env_->NowMicros();
+      alloc_count_ += 1;
+    }
 
-    //     if (allocated_zone != nullptr) {
-    //       assert(allocated_zone->IsBusy());
-    //       allocated_zone->lifetime_ = file_lifetime;
-    //       new_zone = true;
-    //     } else {
-    //       PutActiveIOZoneToken();
-    //     }
-    //   }
-    //   if(allocated_zone != nullptr){
-    //     fprintf(stdout, "\t\t\t emptyzone ");
-    //   }
-    // } else
     {
       // fprintf(stdout, "Alloc GetBestCAZAMatch --> ");
       s = GetBestCAZAMatch(file_lifetime, &best_diff, &new_zone, &allocated_zone, zoneFile->smallest_, zoneFile->largest_, zoneFile->level_);
@@ -1536,21 +1563,32 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
       
     }
 
-    // if(!allocated_zone){
-    //   // fprintf(stdout, "Try to fill an already open zone!\n");
-    //   s = GetBestOpenZoneMatch(file_lifetime, &best_diff, &allocated_zone);
-    //   if (!s.ok()) {
-    //     PutOpenIOZoneToken(); //Giving it up 
-    //     return s;
-    //   }
-    //   if(allocated_zone != nullptr){
-    //     fprintf(stdout, "\t\t\t alreadyOpen ");
-    //   }
-    // }
-
-    if(allocated_zone != nullptr){
-      // fprintf(stdout, "----------->>>>>>> zone alloc id : %d\n", allocated_zone->zone_id_);
+    if (file_lifetime > 2) {
+      elapsed = env_->NowMicros() - start;
+      alloc_time_ += elapsed;
     }
+
+    if (allocated_zone->min_lifetime_ > file_lifetime) {
+      allocated_zone->min_lifetime_ = file_lifetime;
+    }
+
+    int diff_min = file_lifetime - allocated_zone->min_lifetime_;
+    int diff_max = allocated_zone->lifetime_ - file_lifetime;
+    int diff_result = 0;
+    if (diff_min > diff_max) {
+      diff_result = diff_min;
+    } else {
+      diff_result = diff_max;
+    }
+    diff_cnt_[diff_result]++;
+    
+    if (diff_result == 0) {
+      diff_cnt_[100 + file_lifetime]++;
+    }
+
+    // if(allocated_zone != nullptr){
+    //   fprintf(stdout, "----------->>>>>>> zone alloc id : %d\n", allocated_zone->zone_id_);
+    // }
 
   }
 
@@ -1572,7 +1610,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
 
   metrics_->ReportGeneral(ZENFS_OPEN_ZONES_COUNT, open_io_zones_);
   metrics_->ReportGeneral(ZENFS_ACTIVE_ZONES_COUNT, active_io_zones_);
-
+  
   return IOStatus::OK();
 }
 
@@ -1635,27 +1673,27 @@ void ZonedBlockDevice::PrintVictimInformation(const Zone* z, bool is_zc) {
   std::vector<ZoneExtentInfo *> valid_list;
   
   for(auto ext_info: z->extent_info_) {
-      
-      if(ext_info->valid_) {
-          uint64_t cur_length = (uint64_t)ext_info->length_;
-          uint64_t align = (uint64_t)(cur_length % zbd_be_->block_sz_);
-          uint64_t pad = 0;
-          if(align){
-              pad = zbd_be_->block_sz_ - align;
-          }
-          valid_extent_length += (cur_length + pad);
-          valid_list.push_back(ext_info);
-      } else {
-          uint64_t cur_length = (uint64_t)ext_info->length_;
-          uint64_t align = (uint64_t)(cur_length % zbd_be_->block_sz_);
-          uint64_t pad = 0;
-          if(align){
-              pad = zbd_be_->block_sz_ - align;
-          }
-          invalid_extent_length += (cur_length + pad);
-          invalid_list.push_back(ext_info);
-      }
+    if(ext_info->valid_) {
+        uint64_t cur_length = (uint64_t)ext_info->length_;
+        uint64_t align = (uint64_t)(cur_length % zbd_be_->block_sz_);
+        uint64_t pad = 0;
+        if(align){
+            pad = zbd_be_->block_sz_ - align;
+        }
+        valid_extent_length += (cur_length + pad);
+        valid_list.push_back(ext_info);
+    } else {
+        uint64_t cur_length = (uint64_t)ext_info->length_;
+        uint64_t align = (uint64_t)(cur_length % zbd_be_->block_sz_);
+        uint64_t pad = 0;
+        if(align){
+            pad = zbd_be_->block_sz_ - align;
+        }
+        invalid_extent_length += (cur_length + pad);
+        invalid_list.push_back(ext_info);
+    }
   }
+
   if (is_zc) {
     std::cout << "Zone Information <" << z->start_/2147483648 << ">" <<std::endl;
     std::cout << "start : " << z->start_<< std::fixed << std::endl;
@@ -1677,13 +1715,25 @@ void ZonedBlockDevice::PrintVictimInformation(const Zone* z, bool is_zc) {
   fprintf(stdout, "******************************************************************\n");
 }
 
-void ZonedBlockDevice::printZoneExtentInfo(const std::vector<ZoneExtentInfo *>& list, bool is_zc) {
+void ZonedBlockDevice::printZoneExtentInfo(std::vector<ZoneExtentInfo *> list, bool is_zc) {
   //print each extents file name and legnth
-  for(const auto &ext : list){
+  for(auto &ext : list){
       if (is_zc){
         std::cout<< "file name : " << ext->fname_ << std::endl;
+        std::cout<< "extent start : " << ext->start_ << std::endl;
         std::cout<< "extent length : " << ext->length_ << std::endl;
+        std::cout << "extent Addrr& " << ext->extent_ << std::endl;
       }
+  }
+}
+
+void ZonedBlockDevice::printZoneExtent(std::vector<ZoneExtent*> list) {
+  //print each extents file name and legnth
+  for(auto &ext : list){
+    std::cout<< "zone id : " << ext->zone_->zone_id_ << std::endl;
+    std::cout<< "extent start : " << ext->start_ << std::endl;
+    std::cout<< "extent length : " << ext->length_ << std::endl;
+    std::cout << "extent Addrr& " << &ext << " " << ext << std::endl;
   }
 }
 

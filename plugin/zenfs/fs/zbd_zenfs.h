@@ -112,6 +112,7 @@ class Zone {
   uint64_t max_capacity_;
   uint64_t wp_;
   Env::WriteLifeTimeHint lifetime_;
+  Env::WriteLifeTimeHint min_lifetime_;  
   std::atomic<uint64_t> used_capacity_;
   IOStatus Reset();
   IOStatus Finish();
@@ -126,11 +127,21 @@ class Zone {
   
   std::vector<ZoneExtentInfo *> extent_info_; //CZ
   int zone_id_; //CZ
-  void Invalidate(ZoneExtent* extent); //CZ
+  void Invalidate(ZoneExtent* extent, ZoneFile* zoneFile); //CZ
+  void tracking_where_realExtentInfo(ZoneExtent* extent, ZoneFile* zoneFile); //CZ
   int GetIOZoneID() { return start_/2147483648; }
 
   void PushExtentInfo(ZoneExtentInfo* extent_info) { 
     extent_info_.push_back(extent_info);
+  };
+
+  void EraseExtentInfo(ZoneExtent* extent) { 
+    // std::cout << "EraseExtentInfo " << extent << "\n";
+    for(const auto ex : extent_info_) {
+      if (ex->extent_ == extent) {
+        ex->invalidate();
+      }
+    }
   };
 
   bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
@@ -155,7 +166,8 @@ class ZonedBlockDeviceBackend {
   uint32_t block_sz_ = 0;
   uint64_t zone_sz_ = 0;
   uint32_t nr_zones_ = 0;
-
+  uint64_t zone_capacity_ = 0; // jy
+  
  public:
   virtual IOStatus Open(bool readonly, bool exclusive,
                         unsigned int *max_active_zones,
@@ -200,7 +212,6 @@ class ZonedBlockDevice {
  private:
   std::unique_ptr<ZonedBlockDeviceBackend> zbd_be_;
   std::vector<Zone *> io_zones;
-  std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
   time_t start_time_;
   std::shared_ptr<Logger> logger_;
@@ -228,8 +239,8 @@ class ZonedBlockDevice {
 
   std::mutex level_mtx_[4000];
 
-  std::atomic<long> active_io_zones_;
-  std::atomic<long> open_io_zones_;
+  // std::atomic<long> active_io_zones_;
+  // std::atomic<long> open_io_zones_;
   /* Protects zone_resuorces_  condition variable, used
      for notifying changes in open_io_zones_ */
   std::mutex zone_resources_mtx_;
@@ -241,8 +252,8 @@ class ZonedBlockDevice {
   std::mutex migrate_zone_mtx_;
   std::atomic<bool> migrating_{false};
 
-  unsigned int max_nr_active_io_zones_;
-  unsigned int max_nr_open_io_zones_;
+  // unsigned int max_nr_active_io_zones_;
+  // unsigned int max_nr_open_io_zones_;
 
   std::shared_ptr<ZenFSMetrics> metrics_;
 
@@ -250,6 +261,16 @@ class ZonedBlockDevice {
                       const std::vector<Zone *> zones);
 
  public:
+  std::atomic<long> active_io_zones_;
+  std::atomic<long> open_io_zones_;
+  
+  unsigned int max_nr_active_io_zones_;
+  unsigned int max_nr_open_io_zones_;
+
+  std::atomic<uint64_t> alloc_count_{0};
+  std::atomic<uint64_t> alloc_time_{0};
+  std::atomic<int64_t> diff_cnt_[200]{0};
+
   unsigned int zone_alloc_mode; // 1: default , 2: CAZA (modified by DE)
   DBImpl* db_ptr_;
   void SetDBPointer(DBImpl* db);
@@ -259,6 +280,13 @@ class ZonedBlockDevice {
   std::map<uint64_t, std::shared_ptr<ZoneFile>> files_;
   std::mutex files_mtx_;
   std::mutex zone_cleaning_mtx;
+
+  std::condition_variable gc_resource_;
+  std::mutex gc_zone_mtx_;
+  std::atomic<bool> zone_gc_doing{false};
+
+  std::mutex io_zones_mtx;
+  std::atomic<bool> io_doing{false};
 
   explicit ZonedBlockDevice(std::string path, ZbdBackendType backend,
                             std::shared_ptr<Logger> logger,
@@ -276,6 +304,7 @@ class ZonedBlockDevice {
   uint64_t GetFreeSpace();
   uint64_t GetUsedSpace();
   uint64_t GetReclaimableSpace();
+  uint64_t GetLastZoneNum();
 
   uint64_t GetBlockingTime(int lifetime);
   uint64_t GetOccupiedZoneNum(int lifetime);
@@ -293,6 +322,7 @@ class ZonedBlockDevice {
   uint64_t GetZoneSize();
   uint32_t GetNrZones();
   std::vector<Zone *> GetMetaZones() { return meta_zones; }
+  std::vector<Zone *> GetIOZones() { return io_zones; }
 
   void SetFinishTreshold(uint32_t threshold) { finish_threshold_ = threshold; }
 
@@ -310,7 +340,7 @@ class ZonedBlockDevice {
   int Read(char *buf, uint64_t offset, int n, bool direct);
 
   IOStatus ReleaseMigrateZone(Zone *zone);
-
+  // IOStatus ZonedBlockDevice::AllocateZoneForCleaning(Zone **out_zone);
   IOStatus TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint lifetime,
                            uint32_t min_capacity, ZoneFile* zoneFile);
 
@@ -322,7 +352,11 @@ class ZonedBlockDevice {
   uint64_t GetTotalBytesWritten() { return bytes_written_.load(); };
 
   void PrintVictimInformation(const Zone*, bool = true); //CZ
-  void printZoneExtentInfo(const std::vector<ZoneExtentInfo *>&, bool = true); //CZ
+  void printZoneExtentInfo(std::vector<ZoneExtentInfo *>, bool = true); //CZ
+  void printZoneExtent(std::vector<ZoneExtent*> list); //CZ
+
+  void ZoneUtilization();
+  uint64_t GetZoneCapacity();
 
  private:
   IOStatus GetZoneDeferredStatus();

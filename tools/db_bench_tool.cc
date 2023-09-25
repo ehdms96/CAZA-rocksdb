@@ -263,9 +263,9 @@ IF_ROCKSDB_LITE("",
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
-DEFINE_int64(num_op, 1000000, "Number of operations");
+DEFINE_uint64(num_op, 1000000, "Number of operations"); //YCSB
 
-DEFINE_int64(num_record, 1000000, "Number of records");
+DEFINE_uint64(num_record, 1000000, "Number of records"); // YCSB
 
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
@@ -1760,15 +1760,10 @@ DEFINE_bool(build_info, false,
 
 DEFINE_bool(track_and_verify_wals_in_manifest, false,
             "If true, enable WAL tracking in the MANIFEST");
-// YCSB
-DEFINE_uint32(ycsb_type, -1,
-              "load : 0, type a : 1, type b : 2, type c : 3, type d : 4, type e : 5, type f : 6");
-
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
-  using namespace util;
-
+    using namespace util; // YCSB
 static Status CreateMemTableRepFactory(
     const ConfigOptions& config_options,
     std::shared_ptr<MemTableRepFactory>* factory) {
@@ -2173,10 +2168,25 @@ class Stats {
   std::string message_;
   bool exclude_from_merge_;
   ReporterAgent* reporter_agent_;  // does not own
+
   friend class CombinedStats;
 
  public:
+  // std::atomic<bool> is_ycsb_{false};
+  bool is_ycsb_{false};
+  // uint64_t op_count_[DBOperation::MAXOPTYPE]{0};
+  // std::atomic<uint64_t> op_count_[5]{0};
+  uint64_t op_count_[5]{0};
+  // std::atomic<uint64_t> latency_sum_[5]{0};
+  uint64_t latency_sum_[5]{0};
+  // uint64_t latency_min_[DBOperation::MAXOPTYPE];
+  // uint64_t latency_max_[DBOperation::MAXOPTYPE];
+  // std::atomic<uint64_t> op_bytes_[5]{0};
+  uint64_t op_bytes_[5]{0};
+
+
   Stats() : clock_(FLAGS_env->GetSystemClock().get()) { Start(-1); }
+  Stats(const Stats &stat) = default;
 
   void SetReporterAgent(ReporterAgent* reporter_agent) {
     reporter_agent_ = reporter_agent;
@@ -2184,8 +2194,8 @@ class Stats {
 
   void Start(int id) {
     id_ = id;
-    next_report_ = FLAGS_stats_interval ? FLAGS_stats_interval : 100;
     last_op_finish_ = start_;
+    next_report_ = FLAGS_stats_interval ? FLAGS_stats_interval : 100;
     hist_.clear();
     done_ = 0;
     last_report_done_ = 0;
@@ -2203,6 +2213,9 @@ class Stats {
   void Merge(const Stats& other) {
     if (other.exclude_from_merge_) return;
 
+    if (other.is_ycsb_ == true)
+      is_ycsb_ = true;
+    
     for (auto it = other.hist_.begin(); it != other.hist_.end(); ++it) {
       auto this_it = hist_.find(it->first);
       if (this_it != hist_.end()) {
@@ -2210,6 +2223,17 @@ class Stats {
       } else {
         hist_.insert({it->first, it->second});
       }
+    }
+
+    for (uint64_t i = 0; i < DBOperation::MAXOPTYPE; i++) {
+      // if (other.op_count_[i] == 0)
+      //   continue;
+      // op_count_[i].fetch_add(other.op_count_[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+      // latency_sum_[i].fetch_add(other.latency_sum_[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+      // op_bytes_[i].fetch_add(other.op_bytes_[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+      op_count_[i] += other.op_count_[i];
+      latency_sum_[i] += other.latency_sum_[i];
+      op_bytes_[i] += other.op_bytes_[i];
     }
 
     done_ += other.done_;
@@ -2271,6 +2295,19 @@ class Stats {
   void ResetLastOpTime() {
     // Set to now to avoid latency from calls to SleepForMicroseconds.
     last_op_finish_ = clock_->NowMicros();
+  }
+
+  // void ReportYCSB(enum OperationType op_type, uint64_t latency, uint64_t bytes) {
+  void ReportYCSB(enum DBOperation op_type, uint64_t latency, uint64_t bytes) {
+    if (is_ycsb_ == false)
+      is_ycsb_ = true;
+    
+    // op_count_[op_type].fetch_add(1, std::memory_order_relaxed);
+    op_count_[op_type] += 1;
+    // latency_sum_[op_type].fetch_add(latency, std::memory_order_relaxed);
+    latency_sum_[op_type] += latency;
+    // op_bytes_[op_type].fetch_add(bytes, std::memory_order_relaxed);
+    op_bytes_[op_type] += bytes;
   }
 
   void FinishedOps(DBWithColumnFamilies* db_with_cfh, DB* db, int64_t num_ops,
@@ -2405,7 +2442,7 @@ class Stats {
     if (done_ < 1) done_ = 1;
 
     std::string extra;
-    double elapsed = (finish_ - start_) * 1e-6;
+    double elapsed = (finish_ - start_) * 1e-6; // 총 걸린시간(s)
     if (bytes_ > 0) {
       // Rate is computed on actual elapsed time, not the sum of per-thread
       // elapsed times.
@@ -2429,6 +2466,24 @@ class Stats {
                 it->second->ToString().c_str());
       }
     }
+
+    if (is_ycsb_) {
+      fprintf(stdout, "YCSB stats\n");
+      for (uint64_t i = 0; i < DBOperation::MAXOPTYPE; i++) {
+        uint64_t cnt = op_count_[i];
+        if (cnt == 0)
+          continue;
+
+        uint64_t lat_sum = latency_sum_[i];
+        uint64_t bytes_sum = op_bytes_[i];
+        
+        fprintf(stdout, "bytes sum : %lu lat sum : %lu\n", bytes_sum, lat_sum);
+        fprintf(stdout, "op : %ld cnt : %ld Avg Lat : %lf micros, Thpt : %lf bytes/s,%lf ops/s\n", i, cnt, ((cnt > 0) ?
+                          static_cast<double>(lat_sum) / cnt : 0), 
+                          static_cast<double>(bytes_sum) / elapsed, static_cast<double>(cnt) / elapsed);
+      }
+    }
+
     if (FLAGS_report_file_operations) {
       auto* counted_fs =
           FLAGS_env->GetFileSystem()->CheckedCast<CountedFileSystem>();
@@ -2700,8 +2755,8 @@ class Benchmark {
   DBWithColumnFamilies db_;
   std::vector<DBWithColumnFamilies> multi_dbs_;
   int64_t num_;
-  int64_t num_op_;
-  int64_t num_record_;
+  int64_t num_op_; // YCSB
+  int64_t num_record_; // YCSB
   int key_size_;
   int user_timestamp_size_;
   int prefix_size_;
@@ -2715,7 +2770,6 @@ class Benchmark {
   ReadOptions read_options_;
   WriteOptions write_options_;
   Options open_options_;  // keep options around to properly destroy db later
-  int ycsb_type_; // 0 ~ 6
 #ifndef ROCKSDB_LITE
   TraceOptions trace_options_;
   TraceOptions block_cache_trace_options_;
@@ -2731,7 +2785,7 @@ class Benchmark {
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
 
-  // YCSB related member variables
+  // YCSB
   CounterGenerator *key_sequence_; // counter generator -> load operation
   Generator<uint64_t> *key_chooser_;
   Generator<uint64_t> *scan_length_; // uniform generator
@@ -2742,7 +2796,7 @@ class Benchmark {
 
   int zero_padding_;
   bool ordered_insert_;
-  int field_count_; // default : 10
+  int field_count_; // default : 8
   std::string field_prefix_; // default : field
   bool read_all_fields_; // default : true
   bool write_all_fields_; // default : false
@@ -3013,8 +3067,8 @@ class Benchmark {
 #endif
 #endif
   }
-
-  // YCSB functions
+  
+  // YCSB
   uint64_t NextTxnKeyNum() {
     uint64_t key;
     do {
@@ -3025,33 +3079,32 @@ class Benchmark {
   }
 
   std::string BuildKeyName(uint64_t key_num) {
-    if (!ordered_insert_) {
+    if (!ordered_insert_) { // orderd_insert_ == false
       key_num = Hash(key_num);
     }
-
+    // fprintf(stdout, "keynum : %ld", key_num);
     std::string prekey = "user";
     std::string value = std::to_string(key_num);
     int fill = std::max(0, zero_padding_ - static_cast<int>(value.size()));
+    // int fill = std::max(0, FLAGS_key_size - static_cast<int>(value.size()));
     std::string pre_key("user");
 
     return prekey.append(fill, '0').append(value);
   }
 
-  void BuildValues(std::vector<Field> &values) {
+  void BuildValues(std::vector<Field>& values) {
     for (int i = 0; i < field_count_; i++) {
       values.push_back(Field());
       Field& field = values.back();
       field.name.append(field_prefix_).append(std::to_string(i));
       uint64_t len = field_len_generator_->Next();
+      len = len - field.name.size() - sizeof(uint32_t) - sizeof(uint32_t); //
+      // fprintf(stdout, "len : %ld name len : %ld\n", len, field.name.size());
       field.value.reserve(len);
       RandomByteGenerator byte_generator;
       std::generate_n(std::back_inserter(field.value), len,
                       [&]() { return byte_generator.Next(); });
     }
-  }
-  
-  std::string NextFieldName() {
-    return std::string(field_prefix_).append(std::to_string(field_chooser_->Next()));
   }
 
   void BuildSingleValue(std::vector<Field>& values) {
@@ -3063,6 +3116,10 @@ class Benchmark {
     RandomByteGenerator byte_generator;
     std::generate_n(std::back_inserter(field.value), len,
                     [&]() { return byte_generator.Next(); });
+  }
+
+  std::string NextFieldName() {
+    return std::string(field_prefix_).append(std::to_string(field_chooser_->Next()));
   }
 
   static bool KeyExpired(const TimestampEmulator* timestamp_emulator,
@@ -3216,7 +3273,7 @@ class Benchmark {
 #else
         use_blob_db_(false),  // Stacked BlobDB
 #endif  // !ROCKSDB_LITE
-        read_operands_(false) { 
+        read_operands_(false) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -3358,7 +3415,6 @@ class Benchmark {
 
   void GenerateKeyFromIntForSeek(uint64_t v, int64_t num_keys, Slice* key) {
     GenerateKeyFromInt(v, num_keys, key);
-    // default : false
     if (FLAGS_seek_missing_prefix) {
       assert(prefix_size_ > 8);
       char* key_ptr = const_cast<char*>(key->data());
@@ -3425,7 +3481,6 @@ class Benchmark {
     if (!SanityCheck()) {
       ErrorExit();
     }
-
     Open(&open_options_);
     PrintHeader(open_options_);
     std::stringstream benchmark_stream(FLAGS_benchmarks);
@@ -3434,8 +3489,8 @@ class Benchmark {
     while (std::getline(benchmark_stream, name, ',')) {
       // Sanitize parameters
       num_ = FLAGS_num;
-      num_op_ = FLAGS_num_op;
-      num_record_ = FLAGS_num_record;
+      num_op_ = FLAGS_num_op; // YCSB
+      num_record_ = FLAGS_num_record; // YCSB
       reads_ = (FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads);
       writes_ = (FLAGS_writes < 0 ? FLAGS_num : FLAGS_writes);
       deletes_ = (FLAGS_deletes < 0 ? FLAGS_num : FLAGS_deletes);
@@ -3465,23 +3520,20 @@ class Benchmark {
       read_options_.async_io = FLAGS_async_io;
       read_options_.optimize_multiget_for_io = FLAGS_optimize_multiget_for_io;
 
-      // initialize ycsb related member variables
-      ycsb_type_ = FLAGS_ycsb_type;
-
-      field_count_ = 10;
+      // YCSB
+      field_count_ = 8;
       field_prefix_ = "field";
       int field_len = 100;
       field_len_generator_ = new ConstGenerator(field_len); // it will always return 100
       field_chooser_ = new UniformGenerator(0, field_count_ - 1);
 
       key_sequence_ = new CounterGenerator(0);
-      // txn_insert_key_seq_ = new AcknowledgedCounterGenerator(num_);
       txn_insert_key_seq_ = new AcknowledgedCounterGenerator(num_record_);
-      field_count_ = 10;
 
       zero_padding_ = 1;
       read_all_fields_ = true;
-      write_all_fields_ = false;
+      // write_all_fields_ = false;
+      write_all_fields_ = true;
       ordered_insert_ = false;
 
       void (Benchmark::*method)(ThreadState*) = nullptr;
@@ -3520,65 +3572,11 @@ class Benchmark {
         }
       }
 
-      if (ycsb_type_ == YCSB_OP_MODE::LOAD) {
-        fresh_db = true;
-        method = &Benchmark::YcsbLoad;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::A) { // requestdistribution=zipfian
-        fresh_db = false;
-        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
-        operation_chooser_.AddValue(DBOperation::READ, 0.5);
-        operation_chooser_.AddValue(DBOperation::UPDATE, 0.5);
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::B) { // requestdistribution=zipfian
-        fresh_db = false;
-        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
-        operation_chooser_.AddValue(DBOperation::READ, 0.95);
-        operation_chooser_.AddValue(DBOperation::UPDATE, 0.05);
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::C) { // requestdistribution=zipfian
-        fresh_db = false;
-        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
-        operation_chooser_.AddValue(DBOperation::READ, 1);
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::D) { // requestdistribution=latest
-        fresh_db = false;
-        key_chooser_ = new SkewedLatestGenerator(*txn_insert_key_seq_);
-        operation_chooser_.AddValue(DBOperation::READ, 0.95);
-        operation_chooser_.AddValue(DBOperation::INSERT, 0.05);
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::E) { // requestdistribution=zipfian, scanlengthdistribution=uniform
-        fresh_db = false;
-        int op_count = num_op_;
-        double insert_proportion = 0.05;
-        uint32_t min_scan_len = 1;
-        uint32_t max_scan_len = 100; // workload E uses max_scan_len 100
-
-        int new_keys = (int)(op_count * insert_proportion * 2);
-        key_chooser_ = new ScrambledZipfianGenerator(num_record_ + new_keys);
-        scan_length_ = new UniformGenerator(min_scan_len, max_scan_len);
-        operation_chooser_.AddValue(DBOperation::SCAN, 0.95);
-        operation_chooser_.AddValue(DBOperation::INSERT, 0.05);
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      } else if (ycsb_type_ == YCSB_OP_MODE::F){ // requestdistribution=zipfian
-        fresh_db = false;
-        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
-        operation_chooser_.AddValue(DBOperation::READ, 0.5);
-        operation_chooser_.AddValue(DBOperation::READMODIFYWRITE, 0.5); // request distribution : zipfian
-        method = &Benchmark::YcsbTxn;
-        goto YCSB;
-      }
-
       // Both fillseqdeterministic and filluniquerandomdeterministic
       // fill the levels except the max level with UNIQUE_RANDOM
       // and fill the max level with fillseq and filluniquerandom, respectively
-      if ((name == "fillseqdeterministic" ||
-          name == "filluniquerandomdeterministic")) { // ycsb x
+      if (name == "fillseqdeterministic" ||
+          name == "filluniquerandomdeterministic") {
         if (!FLAGS_disable_auto_compactions) {
           fprintf(stderr,
                   "Please disable_auto_compactions in FillDeterministic "
@@ -3726,6 +3724,53 @@ class Benchmark {
         method = &Benchmark::RandomWithVerify;
       } else if (name == "fillseekseq") {
         method = &Benchmark::WriteSeqSeekSeq;
+      } else if (name == "YCSBLOAD") { // YCSB LOAD
+        fresh_db = true;
+        method = &Benchmark::YcsbLoad;
+      } else if (name == "YCSBA") { // YCSB A(R5,U5)
+        // fprintf(stdout, "YCSBA\n");
+        fresh_db = false;
+        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
+        operation_chooser_.AddValue(DBOperation::READ, 0.5);
+        operation_chooser_.AddValue(DBOperation::UPDATE, 0.5);
+        method = &Benchmark::YcsbTxn;
+      } else if (name =="YCSBB") { // YCSB B(R95,U5)
+        // fprintf(stdout, "YCSBB\n");
+        fresh_db = false;
+        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
+        operation_chooser_.AddValue(DBOperation::READ, 0.95);
+        operation_chooser_.AddValue(DBOperation::UPDATE, 0.05);
+        method = &Benchmark::YcsbTxn;
+      } else if (name == "YCSBC") { // YCSB C(R100)
+        fresh_db = false;
+        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
+        operation_chooser_.AddValue(DBOperation::READ, 1);
+        method = &Benchmark::YcsbTxn;
+      } else if (name == "YCSBD") {
+        fresh_db = false;
+        key_chooser_ = new SkewedLatestGenerator(*txn_insert_key_seq_);
+        operation_chooser_.AddValue(DBOperation::READ, 0.95);
+        operation_chooser_.AddValue(DBOperation::INSERT, 0.05);
+        method = &Benchmark::YcsbTxn;
+      } else if (name == "YCSBE") {
+        fresh_db = false;
+        int op_count = num_op_;
+        double insert_proportion = 0.05;
+        uint32_t min_scan_len = 1;
+        uint32_t max_scan_len = 100; // workload E uses max_scan_len 100
+
+        int new_keys = (int)(op_count * insert_proportion * 2);
+        key_chooser_ = new ScrambledZipfianGenerator(num_record_ + new_keys);
+        scan_length_ = new UniformGenerator(min_scan_len, max_scan_len);
+        operation_chooser_.AddValue(DBOperation::SCAN, 0.95);
+        operation_chooser_.AddValue(DBOperation::INSERT, 0.05);
+        method = &Benchmark::YcsbTxn;
+      } else if (name == "YCSBF") {
+        fresh_db = false;
+        key_chooser_ = new ScrambledZipfianGenerator(num_record_);
+        operation_chooser_.AddValue(DBOperation::READ, 0.5);
+        operation_chooser_.AddValue(DBOperation::READMODIFYWRITE, 0.5); // request distribution : zipfian
+        method = &Benchmark::YcsbTxn;
       } else if (name == "compact") {
         method = &Benchmark::Compact;
       } else if (name == "compactall") {
@@ -3827,9 +3872,8 @@ class Benchmark {
         fprintf(stderr, "unknown benchmark '%s'\n", name.c_str());
         ErrorExit();
       }
-YCSB:
+
       if (fresh_db) {
-        std::cout << "fresh db\n";
         if (FLAGS_use_existing_db) {
           fprintf(stdout, "%-12s : skipped (--use_existing_db is true)\n",
                   name.c_str());
@@ -4098,7 +4142,7 @@ YCSB:
       arg[i].thread = new ThreadState(i, total_thread_count_);
       arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
       arg[i].thread->shared = &shared;
-      FLAGS_env->StartThread(ThreadBody, &arg[i]); // start_
+      FLAGS_env->StartThread(ThreadBody, &arg[i]);
     }
 
     shared.mu.Lock();
@@ -4397,8 +4441,7 @@ YCSB:
                 options.memtable_factory->Name());
       }
 
-      // int bloom_bits_per_key = FLAGS_bloom_bits;
-      int bloom_bits_per_key = 0; // ycsb default option
+      int bloom_bits_per_key = FLAGS_bloom_bits;
       if (bloom_bits_per_key < 0) {
         bloom_bits_per_key = PlainTableOptions().bloom_bits_per_key;
       }
@@ -5116,9 +5159,24 @@ YCSB:
   }
 
   enum WriteMode { RANDOM, SEQUENTIAL, UNIQUE_RANDOM };
-  
+  // YCSB
   enum YCSB_OP_MODE { LOAD, A, B, C, D, E, F };
   enum YCSB_MODE { YCSB_LOAD, YCSB_TXN };
+  enum YCSB_OP_TYPE {
+    INSERT = 0,
+    READ,
+    UPDATE,
+    SCAN,
+    READMODIFYWRITE,
+    DELETE,
+    INSERT_FAILED,
+    READ_FAILED,
+    UPDATE_FAILED,
+    SCAN_FAILED,
+    READMODIFYWRITE_FAILED,
+    DELETE_FAILED,
+    MAXOPTYPE
+  };
 
   void SerializeRow(const std::vector<Field>& values, std::string& data) {
     for (const Field& field : values) {
@@ -5182,7 +5240,7 @@ YCSB:
     const char* lim = p + data.size();
     DeserializeRow(values, p, lim);
   }
-  
+
   void WriteSeqDeterministic(ThreadState* thread) {
     DoDeterministicCompact(thread, open_options_.compaction_style, SEQUENTIAL);
   }
@@ -5194,12 +5252,11 @@ YCSB:
 
   void WriteSeq(ThreadState* thread) { DoWrite(thread, SEQUENTIAL); }
 
-
   void WriteRandom(ThreadState* thread) { DoWrite(thread, RANDOM); }
-  
+
   void YcsbLoad(ThreadState *thread) { DoYCSB(thread, YCSB_LOAD); }
 
-  void YcsbTxn(ThreadState *thread) { DoYCSB(thread, YCSB_TXN); };
+  void YcsbTxn(ThreadState *thread) { DoYCSB(thread, YCSB_TXN); }
 
   void WriteUniqueRandom(ThreadState* thread) {
     DoWrite(thread, UNIQUE_RANDOM);
@@ -5271,100 +5328,115 @@ YCSB:
     return FLAGS_sine_a * sin((FLAGS_sine_b * x) + FLAGS_sine_c) + FLAGS_sine_d;
   }
 
-  // multi db x, column familiy 1개
-  // single thread
+  // YCSB
+
+   // multi db x, column familiy 1개
   void DoYCSB(ThreadState *thread, YCSB_MODE mode) {
     // const int num_op_type = 5;
     if (mode == YCSB_LOAD) {
-      std::cout << "ycsb load\n";
+      // std::cout << "ycsb load\n";
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      Duration duration(0, num_op_);
 
-      int i = 0;
-      while (i < num_record_) {
-        std::string key = BuildKeyName(key_sequence_->Next());
+      while (!duration.Done(1)) {
+        uint64_t key_num = key_sequence_->Next();
+        if (!ordered_insert_) {  // orderd_insert_ == false
+          key_num = Hash(key_num) % num_record_;
+        }
+        // std::string key = BuildKeyName(key_num);
+        GenerateKeyFromInt(key_num, num_record_, &key);
+
         std::vector<Field> fields;
         BuildValues(fields);
-
+        // Slice value = gen.Generate();
+        
+        // uint64_t start = FLAGS_env->NowMicros();
         std::string data;
         SerializeRow(fields, data);
-        rocksdb::WriteOptions wopt;
-        rocksdb::Status s = db_.db->Put(wopt, key, data);
-        
+        rocksdb::Status s = db_.db->Put(write_options_, key, data);
+
         if (!s.ok()) {
           fprintf(stdout, "ycsb put error\n");
           ErrorExit();
         }
-        thread->stats.FinishedOps(&db_, db_.db, entries_per_batch_, kWrite);
-        thread->stats.AddBytes(data.size());
-        i++;   
+        // uint64_t elapsed = FLAGS_env->NowMicros() - start;l
+        thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
+        // thread->stats.FinishedOps(&db_, db_.db, entries_per_batch_, kWrite);
+        thread->stats.AddBytes(key.size() + data.size());
       }
-      
+  
     } else {
-      int64_t num_ops = num_op_;
-      // int op_counts[5] = { 0 }; // 0 : update, 1 : read, 2 : insert, 3 : scan, 4 : read-modify-write
-
-      Duration duration(0, num_ops);
-      while (!duration.Done(1)) { // 0 ~ num_ops
+      // fprintf(stdout, "ycsb txn\n");
+      std::unique_ptr<const char[]> key_guard;
+      Slice key = AllocateKey(&key_guard);
+      ReadOptions roptions = read_options_;
+      Duration duration(0, num_op_);
+      
+      while (!duration.Done(1)) {
         DBOperation op;
         op = static_cast<DBOperation>(operation_chooser_.Next());
         
         if (op == DBOperation::READ) {
-          // std::cout << "ycsb read\n";
           uint64_t key_num = NextTxnKeyNum();
-          std::string key = BuildKeyName(key_num);
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
+          // std::string key = BuildKeyName(key_num);
+          uint64_t start = FLAGS_env->GetSystemClock().get()->NowMicros();
           std::vector<Field> result;
+          std::string data;
+          uint32_t read_bytes = 0;
 
-          if (!read_all_fields_) {
-            std::vector<std::string> fields;
-            fields.push_back(NextFieldName());
+          rocksdb::Status s = db_.db->Get(roptions, key, &data);
 
-            std::string data;
-            rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-            if (!s.ok()) {
-              fprintf(stdout, "ycsb read error\n");
-              exit(1);
-            }
-            DeserializeRowFilter(result, data, fields);
-            thread->stats.AddBytes(key.size() + data.size());
-          } else {
-            std::string data;
-            rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-
-            if (!s.ok()) {
-              fprintf(stdout, "ycsb read error\n");
-              exit(1);
-            }
-
-            DeserializeRow(result, data);
-            thread->stats.AddBytes(key.size() + data.size());
+          // read++;
+          if (s.ok()) {
+            read_bytes += key.size() + data.size();
+            // found++;
+          } else if (!s.IsNotFound()) {
+            fprintf(stderr, "ycsb read error\n");
+            abort();
+            // exit(1);
           }
 
+          DeserializeRow(result, data);
+          assert(result.size() == static_cast<uint64_t>(field_count_));
+
+          uint64_t elapsed = FLAGS_env->GetSystemClock().get()->NowMicros() - start;
+
+          // fprintf(stdout, "read latency : %lu\n", elapsed);
+          thread->stats.ReportYCSB(op, elapsed, read_bytes);
+          thread->stats.AddBytes(read_bytes);
           thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
         } else if (op == DBOperation::UPDATE) {
-          // std::cout << "ycsb update\n";
           uint64_t key_num = NextTxnKeyNum();
-          std::string key = BuildKeyName(key_num);
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
+          // std::string key = BuildKeyName(key_num);
           std::vector<Field> values;
           uint64_t bytes = 0;
 
-          if (write_all_fields_) {
-            BuildValues(values);
+          if (write_all_fields_) { // default : true -> make value to put
+            BuildValues(values); // make value(vector of Field)
           } else {
             BuildSingleValue(values);
           }
 
           // db.Update()
+          uint64_t start = FLAGS_env->GetSystemClock().get()->NowMicros();
           std::string data;
-          rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-          bytes += key.size() + data.size();
+          rocksdb::Status s = db_.db->Get(roptions, key, &data);
 
-          if (!s.ok()) {
-
+          if (s.ok()) {
+            bytes += key.size() + data.size();
+          } else if (!s.IsNotFound()) {
+            fprintf(stderr, "ycsb update(read) error\n");
+            abort();
+            // exit(1);
           }
 
           std::vector<Field> current_values;
           DeserializeRow(current_values, data);
           assert(current_values.size() == static_cast<size_t>(field_count_));
-
+          // Slice put_data = gen.Generate();
           for (Field &new_field : values) {
             bool found __attribute__ ((unused)) = false;
             for (Field &cur_field : current_values) {
@@ -5376,53 +5448,56 @@ YCSB:
             }
             assert(found);
           }
-          rocksdb::WriteOptions wopt;
 
           data.clear();
           SerializeRow(current_values, data);
-          s = db_.db->Put(wopt, key, data);
+          s = db_.db->Put(write_options_, key, data);
           if (!s.ok()) {
-
+            fprintf(stdout, "ycsb update(put) error\n");
+            exit(1);
           }
           bytes += key.size() + data.size();
-
+          uint64_t elapsed = FLAGS_env->GetSystemClock().get()->NowMicros() - start;
+          // fprintf(stdout, "update latency : %lu\n", elapsed);
+          thread->stats.ReportYCSB(op, elapsed, bytes);
           thread->stats.FinishedOps(nullptr, db_.db, 1, kUpdate);
           thread->stats.AddBytes(bytes);
-
         } else if (op == DBOperation::INSERT) {
-          // std::cout << "ycsb insert\n";
           uint64_t key_num = txn_insert_key_seq_->Next();
-          std::string key = BuildKeyName(key_num);
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
+          // std::string key = BuildKeyName(key_num);
           std::vector<Field> values;
           uint64_t bytes = 0;
-        
           BuildValues(values);
 
+          uint64_t start = FLAGS_env->NowMicros();
           std::string data;
           SerializeRow(values, data);
-          rocksdb::WriteOptions wopt;
-          rocksdb::Status s = db_.db->Put(wopt, key, data);
+          // Slice data = gen.Generate();
+          rocksdb::Status s = db_.db->Put(write_options_, key, data);
           
-          bytes += key.size() + data.size();
-
-          if (!s.ok()) {
+          if (s.ok()) {
+            bytes += key.size() + data.size();
+          } else {
             fprintf(stdout, "put error\n");
+            exit(1);
           }
-
+          uint64_t elapsed = FLAGS_env->NowMicros() - start;
           txn_insert_key_seq_->Acknowledge(key_num);
           
+          thread->stats.ReportYCSB(op, elapsed, bytes);
           thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
           thread->stats.AddBytes(bytes);
 
         } else if (op == DBOperation::SCAN) {
-          // std::cout << "ycsb scan\n";
           uint64_t key_num = NextTxnKeyNum();
-          std::string key = BuildKeyName(key_num);
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
+          // std::string key = BuildKeyName(key_num);
           int len = scan_length_->Next(); // 1 ~ 100
           std::vector<std::vector<Field>> result;
           uint64_t bytes = 0;
 
-          if (!read_all_fields_) {
+          /*if (!read_all_fields_) {
             std::vector<std::string> fields;
             fields.push_back(NextFieldName());
             
@@ -5440,7 +5515,8 @@ YCSB:
             }
 
             delete db_iter;
-          } else { // default
+          } else { // default*/
+            uint64_t start = FLAGS_env->NowMicros();
             rocksdb::Iterator* db_iter =
                 db_.db->NewIterator(rocksdb::ReadOptions());
             db_iter->Seek(key);
@@ -5457,59 +5533,71 @@ YCSB:
               db_iter->Next();
             }
             delete db_iter;
-          }
+          // }
+          uint64_t elapsed = FLAGS_env->NowMicros() - start;
 
+          thread->stats.ReportYCSB(op, elapsed, bytes);
           thread->stats.FinishedOps(&db_, db_.db, 1, kSeek);
           thread->stats.AddBytes(bytes);
         } else {
-          // std::cout << "ycsb readmodifywrite\n";
           uint64_t key_num = NextTxnKeyNum();
-          std::string key = BuildKeyName(key_num);
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
+          // std::string key = BuildKeyName(key_num);
+          uint64_t start = FLAGS_env->GetSystemClock().get()->NowMicros();
           std::vector<Field> result;
+          std::string data;
+          uint32_t read_bytes = 0;
 
-          if (!read_all_fields_) {
-            std::vector<std::string> fields;
-            fields.push_back(NextFieldName());
+          rocksdb::Status s = db_.db->Get(roptions, key, &data);
 
-            std::string data;
-            rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-
-            if (!s.ok()) {
-
-            }
-            DeserializeRowFilter(result, data, fields);
-            thread->stats.AddBytes(key.size() + data.size());
-          }  else {
-            std::string data;
-            rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-
-            if (!s.ok()) {
-
-            }
-            DeserializeRow(result, data);
-            assert(result.size() == static_cast<size_t>(fieldcount_));
-
-            thread->stats.AddBytes(key.size() + data.size());
+          // read++;
+          if (s.ok()) {
+            read_bytes += key.size() + data.size();
+            // found++;
+          } else if (!s.IsNotFound()) {
+            fprintf(stderr, "ycsb read error\n");
+            abort();
+            // exit(1);
           }
 
+          DeserializeRow(result, data);  // data -> result
+          assert(result.size() == static_cast<uint64_t>(field_count_));
+
+          uint64_t elapsed = FLAGS_env->GetSystemClock().get()->NowMicros() - start;
+          // fprintf(stdout, "read latency : %lu\n", elapsed);
+          thread->stats.ReportYCSB(op, elapsed, read_bytes);
+          thread->stats.AddBytes(read_bytes);
+          thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
+          // read end
+          
+          key.clear();
+          // update start
+          key_num = NextTxnKeyNum();
+          GenerateKeyFromInt(key_num, FLAGS_num_record, &key);
           std::vector<Field> values;
-          if (write_all_fields_) {
-            BuildValues(values);
+          uint64_t bytes = 0;
+
+          if (write_all_fields_) { // default : true -> make value to put
+            BuildValues(values); // make value(vector of Field)
           } else {
             BuildSingleValue(values);
           }
 
-          std::string data;
-          rocksdb::Status s = db_.db->Get(rocksdb::ReadOptions(), key, &data);
-          
-          if (!s.ok()) {
+          start = FLAGS_env->GetSystemClock().get()->NowMicros();
+          std::string update_data;
+          s = db_.db->Get(roptions, key, &update_data);
 
+          if (s.ok()) {
+            bytes += key.size() + update_data.size();
+          } else if (!s.IsNotFound()) {
+            fprintf(stderr, "ycsb update(read) error\n");
+            abort();
           }
 
           std::vector<Field> current_values;
           DeserializeRow(current_values, data);
           assert(current_values.size() == static_cast<size_t>(field_count_));
-
+          // Slice put_data = gen.Generate();
           for (Field &new_field : values) {
             bool found __attribute__ ((unused)) = false;
             for (Field &cur_field : current_values) {
@@ -5521,17 +5609,20 @@ YCSB:
             }
             assert(found);
           }
-          rocksdb::WriteOptions wopt;
 
           data.clear();
           SerializeRow(current_values, data);
-          s = db_.db->Put(wopt, key, data);
+          s = db_.db->Put(write_options_, key, data);
           if (!s.ok()) {
-
-          } 
-
+            fprintf(stdout, "ycsb update(put) error\n");
+            exit(1);
+          }
+          bytes += key.size() + data.size();
+          elapsed = FLAGS_env->GetSystemClock().get()->NowMicros() - start;
+          // fprintf(stdout, "update latency : %lu\n", elapsed);
+          thread->stats.ReportYCSB(op, elapsed, bytes);
           thread->stats.FinishedOps(nullptr, db_.db, 1, kUpdate);
-          thread->stats.AddBytes(key.size() + data.size());
+          thread->stats.AddBytes(bytes);
         }
       }
       // std::cout << "total bytes : " << total_bytes << "\n";
@@ -5562,17 +5653,17 @@ YCSB:
     }
     
   }
-  
+
   void DoWrite(ThreadState* thread, WriteMode write_mode) {
     const int test_duration = write_mode == RANDOM ? FLAGS_duration : 0;
     const int64_t num_ops = writes_ == 0 ? num_ : writes_;
 
     size_t num_key_gens = 1;
-    if (db_.db == nullptr) { // default -> multi db x
+    if (db_.db == nullptr) {
       num_key_gens = multi_dbs_.size();
     }
-    std::vector<std::unique_ptr<KeyGenerator>> key_gens(num_key_gens); // default -> num_key_gens = 1
-    int64_t max_ops = num_ops * num_key_gens; // num_ops == num
+    std::vector<std::unique_ptr<KeyGenerator>> key_gens(num_key_gens);
+    int64_t max_ops = num_ops * num_key_gens;
     int64_t ops_per_stage = max_ops;
     if (FLAGS_num_column_families > 1 && FLAGS_num_hot_column_families > 0) {
       ops_per_stage = (max_ops - 1) / (FLAGS_num_column_families /
@@ -5581,12 +5672,11 @@ YCSB:
     }
 
     Duration duration(test_duration, max_ops, ops_per_stage);
-    const uint64_t num_per_key_gen = num_ + max_num_range_tombstones_; // default -> num_ + 0
-    for (size_t i = 0; i < num_key_gens; i++) { 
+    const uint64_t num_per_key_gen = num_ + max_num_range_tombstones_;
+    for (size_t i = 0; i < num_key_gens; i++) {
       key_gens[i].reset(new KeyGenerator(&(thread->rand), write_mode,
-                                         num_per_key_gen, ops_per_stage)); // 한개의 key generator(write_mode, num_, num_)
+                                         num_per_key_gen, ops_per_stage));
     }
-    // key generator -> write_mode와 num에 따라서 동작 <-- to be fixed by YCSB
 
     if (num_ != FLAGS_num) {
       char msg[100];
@@ -5682,7 +5772,7 @@ YCSB:
 
     std::vector<std::unique_ptr<const char[]>> expanded_key_guards;
     std::vector<Slice> expanded_keys;
-    if (FLAGS_expand_range_tombstones) { // default : false
+    if (FLAGS_expand_range_tombstones) {
       expanded_key_guards.resize(range_tombstone_width_);
       for (auto& expanded_key_guard : expanded_key_guards) {
         expanded_keys.emplace_back(AllocateKey(&expanded_key_guard));
@@ -5701,7 +5791,7 @@ YCSB:
     int64_t num_range_deletions = 0;
 
     while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_)) {
-      if (duration.GetStage() != stage) { // stage가 column familiy를 의미하는 듯 -> CF == 1 -> 그냥 무시
+      if (duration.GetStage() != stage) {
         stage = duration.GetStage();
         if (db_.db != nullptr) {
           db_.CreateNewCf(open_options_, stage);
@@ -5713,7 +5803,7 @@ YCSB:
       }
 
       if (write_mode != SEQUENTIAL) {
-        id = thread->rand.Next() % num_key_gens; // num_key_gens == 0(default) -> id == 0
+        id = thread->rand.Next() % num_key_gens;
       } else {
         // When doing a sequential load with multiple databases, load them in
         // order rather than all at the same time to avoid:
@@ -5834,8 +5924,8 @@ YCSB:
             }
           }
         } else {
-          // rand_num = key_gens[id]->Next();
-          rand_num = key_gens[id]->Next() + (thread->tid * num_); // multithread
+          rand_num = key_gens[id]->Next();
+          // rand_num = key_gens[id]->Next() + (thread->tid * num_);
         }
         GenerateKeyFromInt(rand_num, FLAGS_num, &key);
         Slice val;
@@ -5958,8 +6048,6 @@ YCSB:
       if (!use_blob_db_) {
         // Not stacked BlobDB
         s = db_with_cfh->db->Write(write_options_, &batch);
-        if (s.code() != 0)
-          printf("write result : %d\n", s.code());
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);
@@ -5989,11 +6077,10 @@ YCSB:
       }
 
       if (!s.ok()) {
-        fprintf(stderr, "put error1: %s\n", s.ToString().c_str());
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
     }
-
     if ((write_mode == UNIQUE_RANDOM) && (p > 0.0)) {
       fprintf(stdout,
               "Number of unique keys inserted: %" PRIu64
@@ -6516,7 +6603,7 @@ YCSB:
   int64_t GetRandomKey(Random64* rand) {
     uint64_t rand_int = rand->Next();
     int64_t key_rand;
-    if (read_random_exp_range_ == 0) { // default : 0.0
+    if (read_random_exp_range_ == 0) {
       key_rand = rand_int % FLAGS_num;
     } else {
       const uint64_t kBigInt = static_cast<uint64_t>(1U) << 62;
@@ -6557,12 +6644,12 @@ YCSB:
     }
 
     Duration duration(FLAGS_duration, reads_);
-    while (!duration.Done(1)) { // s1부터 reads_만큼 while loop 돔
+    while (!duration.Done(1)) {
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
       // We use same key_rand as seed for key and column family so that we can
       // deterministically find the cfh corresponding to a particular key, as it
       // is done in DoWrite method.
-      if (entries_per_batch_ > 1 && FLAGS_multiread_stride) { // multiread_stride : default 0
+      if (entries_per_batch_ > 1 && FLAGS_multiread_stride) {
         if (++num_keys == entries_per_batch_) {
           num_keys = 0;
           key_rand = GetRandomKey(&thread->rand);
@@ -6574,7 +6661,7 @@ YCSB:
           key_rand += FLAGS_multiread_stride;
         }
       } else {
-        key_rand = GetRandomKey(&thread->rand); // key chooser가 가지고 있는 분포에 따라서 key값 결정
+        key_rand = GetRandomKey(&thread->rand);
       }
       GenerateKeyFromInt(key_rand, FLAGS_num, &key);
       read++;
@@ -6596,6 +6683,8 @@ YCSB:
       } else {
         cfh = db_with_cfh->db->DefaultColumnFamily();
       }
+      
+      // uint64_t start = FLAGS_env->NowMicros();
       if (read_operands_) {
         GetMergeOperandsOptions get_merge_operands_options;
         get_merge_operands_options.expected_max_number_of_operands =
@@ -7158,7 +7247,7 @@ YCSB:
             write_options_, key,
             gen.Generate(static_cast<unsigned int>(val_size)));
         if (!s.ok()) {
-          fprintf(stderr, "put error2: %s\n", s.ToString().c_str());
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           ErrorExit();
         }
 
@@ -7271,7 +7360,7 @@ YCSB:
     std::unique_ptr<const char[]> lower_bound_key_guard;
     Slice lower_bound = AllocateKey(&lower_bound_key_guard);
 
-    Duration duration(FLAGS_duration, reads_); // read_ : # of records to read
+    Duration duration(FLAGS_duration, reads_);
     char value_buffer[256];
     while (!duration.Done(1)) {
       int64_t seek_pos = thread->rand.Next() % FLAGS_num;
@@ -7874,7 +7963,7 @@ YCSB:
           s = db->Put(write_options_, key, gen.Generate());
         }
         if (!s.ok()) {
-          fprintf(stderr, "put error3: %s\n", s.ToString().c_str());
+          fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           ErrorExit();
         }
         put_weight--;
@@ -7890,7 +7979,8 @@ YCSB:
     thread->stats.AddMessage(msg);
   }
 
-
+  //
+  // Read-modify-write for random keys
   void UpdateRandom(ThreadState* thread) {
     ReadOptions options = read_options_;
     RandomGenerator gen;
@@ -7941,7 +8031,7 @@ YCSB:
         s = db->Put(write_options_, key, val);
       }
       if (!s.ok()) {
-        fprintf(stderr, "put error4: %s\n", s.ToString().c_str());
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         exit(1);
       }
       bytes += key.size() + val.size() + user_timestamp_size_;
@@ -8011,7 +8101,7 @@ YCSB:
         s = db->Put(write_options_, key, Slice(new_value));
       }
       if (!s.ok()) {
-        fprintf(stderr, "put error5: %s\n", s.ToString().c_str());
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
       thread->stats.FinishedOps(nullptr, db, 1);
@@ -8079,7 +8169,7 @@ YCSB:
         s = db->Put(write_options_, key, value);
       }
       if (!s.ok()) {
-        fprintf(stderr, "put error6: %s\n", s.ToString().c_str());
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
       bytes += key.size() + value.size() + user_timestamp_size_;
@@ -8657,7 +8747,7 @@ YCSB:
       s = db->Put(write_options_, key, val);
 
       if (!s.ok()) {
-        fprintf(stderr, "put error7: %s\n", s.ToString().c_str());
+        fprintf(stderr, "put error: %s\n", s.ToString().c_str());
         ErrorExit();
       }
       bytes = key.size() + val.size();
@@ -9068,15 +9158,6 @@ int db_bench_tool(int argc, char** argv) {
   ParseCommandLineFlags(&argc, &argv, true);
   FLAGS_compaction_style_e =
       (ROCKSDB_NAMESPACE::CompactionStyle)FLAGS_compaction_style;
-
-  int ycsb_type = FLAGS_ycsb_type; // default : -1
-  if (ycsb_type < -1 && ycsb_type > 6) {
-    fprintf(stderr, "invalid ycsb workload type\n");
-    exit(1);
-  }
-
-  fprintf(stdout, "ycsb type : %d\n", ycsb_type);
-  
 #ifndef ROCKSDB_LITE
   if (FLAGS_statistics && !FLAGS_statistics_string.empty()) {
     fprintf(stderr,
