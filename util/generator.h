@@ -14,12 +14,13 @@
 namespace rocksdb {
 namespace util {
 
-enum class DBOperation: uint64_t {
+enum DBOperation: uint64_t {
   INSERT,
   READ,
   SCAN,
   UPDATE,
-  READMODIFYWRITE
+  READMODIFYWRITE,
+  MAXOPTYPE
 };
 
 const uint64_t kFNVOffsetBasis64 = 0xCBF29CE484222325ull;
