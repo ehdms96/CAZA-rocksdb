@@ -564,7 +564,8 @@ void ZoneFile::ExtentWriteUnlock(){
 
 IOStatus ZoneFile::AllocateNewZone() {
   Zone* zone;
-
+  zbd_->called_AllocateNewZone++;
+  
   // std::cout << "ZoneFile::AllocateNewZone() zoneFile name : " << GetFilename() << " ";
   // fprintf(stdout, "ZoneFile::AllocateNewZone() this->level_ : %d, level : %d\n", this->level_, level_);
 
@@ -630,6 +631,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) { //orizin z
 
     if (active_zone_->capacity_ == 0) {
       s = CloseActiveZone();
+      zbd_->reset_etc++;
       if (!s.ok()) {
         return s;
       }
@@ -695,6 +697,7 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
 
     if (active_zone_->capacity_ == 0) {
       s = CloseActiveZone();
+      zbd_->reset_etc++;
       if (!s.ok()) {
         return s;
       }
@@ -728,6 +731,7 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
       PushExtent();
 
       s = CloseActiveZone();
+      zbd_->reset_etc++;
       if (!s.ok()) {
         return s;
       }
@@ -794,6 +798,7 @@ IOStatus ZoneFile::AppendBuffer_caza() { //caza
       PushExtent();
 
       s = CloseActiveZone();
+      zbd_->reset_etc++;
       if (!s.ok()) {
         return s;
       }
@@ -855,6 +860,7 @@ IOStatus ZoneFile::Append_caza(void* data, int data_size, int valid_size) {
       PushExtent(); 
       
       s = CloseActiveZone();
+      zbd_->reset_etc++;
       if (!s.ok()) {
         return s;
       }

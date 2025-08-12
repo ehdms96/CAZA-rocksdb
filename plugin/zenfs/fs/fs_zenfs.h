@@ -155,6 +155,12 @@ class ZenFS : public FileSystemWrapper {
   bool run_gc_worker_ = false;
   bool run_DZA_worker_ = true;
   
+  std::vector<double> victim_zone_utils;
+  std::vector<std::pair<uint64_t, uint32_t>> gc_zone_utils; // free space, copied data
+  std::vector<uint32_t> victim_zone_cnts;
+  std::vector<uint64_t> free_percents;
+  uint32_t ext_count_ = 0;
+
   std::uint64_t total_copied_data_size = 0;
   std::uint64_t total_copied_data_size2 = 0;
   std::uint64_t total_GC_count = 0;
@@ -466,17 +472,17 @@ class ZenFS : public FileSystemWrapper {
   void GetZenFSSnapshot(ZenFSSnapshot& snapshot,
                         const ZenFSSnapshotOptions& options);
 
-  IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents);
+  IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents, std::unordered_map<uint64_t, uint32_t>& zone_copied_data);
 
   IOStatus MigrateFileExtents(
       const std::string& fname,
-      const std::vector<ZoneExtentSnapshot*>& migrate_exts);
+      const std::vector<ZoneExtentSnapshot*>& migrate_exts, std::unordered_map<uint64_t, uint32_t>& zone_copied_data);
 
   private:
-    const uint64_t GC_START_LEVEL = 90; /* Enable GC when < 20% free space available */
+    const uint64_t GC_START_LEVEL = 20; /* Enable GC when < 20% free space available */
     const uint64_t GC_SLOPE = 3; /* GC agressiveness */
     void GCWorker();
-    void DZAWorker();
+    // void DZAWorker();
 };
 #endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 

@@ -210,6 +210,7 @@ enum class ZbdBackendType {
 
 class ZonedBlockDevice {
  private:
+
   std::unique_ptr<ZonedBlockDeviceBackend> zbd_be_;
   std::vector<Zone *> io_zones;
   std::vector<Zone *> meta_zones;
@@ -261,6 +262,17 @@ class ZonedBlockDevice {
                       const std::vector<Zone *> zones);
 
  public:
+  std::atomic<int64_t> howtoAlloc[10]{0};
+  int called_AllocateIOZone = 0;
+  int called_AllocateNewZone = 0;
+  int called_FinishCheapestIOZone = 0;
+  std::atomic<int> called_ResetUnusedIOZones{0};
+    std::atomic<uint64_t> finish_elapsed_atomic{0};
+    std::atomic<uint32_t> finish_cnt_atomic{0};
+
+  std::atomic<uint32_t> reset_etc{0};
+  std::atomic<uint32_t> early_finish_{0}; // ZenFS, TO-ZenFS early zone finish count
+  int to_finished{0};
   std::atomic<long> active_io_zones_;
   std::atomic<long> open_io_zones_;
   
@@ -309,7 +321,6 @@ class ZonedBlockDevice {
   uint64_t GetBlockingTime(int lifetime);
   uint64_t GetOccupiedZoneNum(int lifetime);
   uint64_t GetMaxIOZones();
-  IOStatus AdjustIOZones(int lifetime, int value);
 
   std::string GetFilename();
   uint32_t GetBlockSize();

@@ -286,7 +286,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   uint64_t i = 0;
   uint64_t m = 0;
   // Reserve one zone for metadata and another one for extent migration
-  int reserved_zones = 2;
+  int reserved_zones = 3;
 
   if (!readonly && !exclusive)
     return IOStatus::InvalidArgument("Write opens must be exclusive");
@@ -399,77 +399,6 @@ uint64_t ZonedBlockDevice::GetMaxIOZones(){
   return max_nr_active_io_zones_ - n_fixed_zones_[0] - n_fixed_zones_[2];
 }
 
-IOStatus ZonedBlockDevice::AdjustIOZones(int lifetime, int value) {
-    level_mtx_[lifetime].lock();
-
-  if (value < 0) {
-
-    Zone *candidate_zone = nullptr;
-    IOStatus s;
-    int64_t candidate_capacity;
-    int used_zone_num = 0;
-
-    for (const auto z : io_zones) {
-      if (z->lifetime_ == lifetime && !z->IsFull()) {
-        used_zone_num++;
-      }
-    }
-
-
-    if (n_fixed_zones_[lifetime] + value >= used_zone_num) {
-      n_fixed_zones_[lifetime] +=value;
-    } else {
-      int target = (value*-1) - (n_fixed_zones_[lifetime] - used_zone_num);
-
-      for (int i=1;i<=target;i++) {
-        candidate_capacity = -1;
-        candidate_zone = nullptr;
-
-        for (const auto z : io_zones) {
-          if(z->lifetime_ == lifetime && !z->IsFull()) {
-            if (candidate_capacity == -1 || candidate_capacity > (int64_t)z->GetCapacityLeft()) {
-              if (candidate_zone != nullptr) candidate_zone->CheckRelease();
-              candidate_zone = z;
-              candidate_capacity = z->GetCapacityLeft();
-            }
-          }
-        }
-        if (candidate_zone == nullptr) {
-          std::cout << "[AdjustIOZones] candidate not found!\n";
-          break;
-        }
-          
-
-        while(!candidate_zone->Acquire());
-
-        if (!candidate_zone->IsFull()) {
-          s = candidate_zone->Finish();
-          if (!s.ok()) {
-            std::cout << "[AdjustIOZones] finish failed\n";
-            candidate_zone->Release();
-          }
-          s = candidate_zone->CheckRelease();
-          if (!s.ok()) {
-            std::cout << "[AdjustIOZones] release failed\n";
-          }
-          PutActiveIOZoneToken();
-        } 
-      }
-      n_fixed_zones_[lifetime] +=value;
-    }
-    
-
-    
-
-
-  } else {
-      n_fixed_zones_[lifetime] +=value;
-  }
-
-  level_mtx_[lifetime].unlock();
-
-  return IOStatus::OK();
-}
 
 uint64_t ZonedBlockDevice::GetBlockingTime(int lifetime) {
 
@@ -673,6 +602,7 @@ IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
   for (const auto z : io_zones) {
     if (z->Acquire()) {
       if (!z->IsEmpty() && !z->IsUsed()) {
+        called_ResetUnusedIOZones++;
         bool full = z->IsFull();
         bool all_invalid = true;
 
@@ -789,6 +719,7 @@ IOStatus ZonedBlockDevice::ApplyFinishThreshold() {
 IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
   IOStatus s;
   Zone *finish_victim = nullptr;
+  called_FinishCheapestIOZone++;
 
   for (const auto z : io_zones) {
     if (z->Acquire()) {
@@ -897,6 +828,8 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
         allocated_zone->lifetime_ = file_lifetime;
         allocated_zone->min_lifetime_ = file_lifetime;
         new_zone = true;
+
+        howtoAlloc[1]++; //sst_to_zone_ empty여서 바로 새로운 empty zone 할당 받은 경우.
       } else {
         PutActiveIOZoneToken();
       }
@@ -957,9 +890,10 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
         if (!s.ok()) return s;
       }
 
-      // if(allocated_zone != nullptr){
-      //   std::cout << "\t\t\t findOverlappedSST get zone id : " << allocated_zone->zone_id_ << std::endl;
-      // }
+      if(allocated_zone != nullptr){
+        //std::cout << "\t\t\t findOverlappedSST get zone id : " << allocated_zone->zone_id_ << std::endl;
+        howtoAlloc[2]++; //overlapped 된 sst파일 찾은경우
+      }
     } // if (!fno_list.empty())
     else if (fno_list.empty() && (level==0 || level==100)) {
       /* (1) There is no matching files being overlapped with current file
@@ -991,9 +925,10 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       s = AllocateMostL0Files(zone_list, &allocated_zone, min_capacity);
       if (!s.ok()) return s;
 
-      // if(allocated_zone != nullptr){
-      //   std::cout << "\t\t\t AllocateMostL0Files get zone id : " << allocated_zone->zone_id_ << std::endl;
-      // }
+      if(allocated_zone != nullptr){
+        //std::cout << "\t\t\t AllocateMostL0Files get zone id : " << allocated_zone->zone_id_ << std::endl;
+        howtoAlloc[3]++; //overlapped 된 sst파일 못찾으면 smallest key기준으로 same level에 있는 zone 찾은경우
+      }
     }
 
     if(!allocated_zone){
@@ -1013,9 +948,10 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
           PutActiveIOZoneToken();
         }
 
-        // if(allocated_zone != nullptr){
-        //   std::cout << "\t\t\t (emptyzone) get zone id : " << allocated_zone->zone_id_ << std::endl;
-        // }
+        if(allocated_zone != nullptr){
+          // std::cout << "\t\t\t (emptyzone) get zone id : " << allocated_zone->zone_id_ << std::endl;
+          howtoAlloc[4]++; //overlapped 된것도 없고 key same level에도 없어서 새로운 zone 찾은경우
+        }
       }
     }
 
@@ -1027,6 +963,7 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       if(allocated_zone != nullptr){
         while (!allocated_zone->Acquire());
         // std::cout << "\t\t\t AllocateZoneWithSameLevelFiles get zone id : " << allocated_zone->zone_id_ << std::endl;
+        howtoAlloc[5]++; //같은 level이 있는 zone 이라도 찾은경우
       }
     }
   }
@@ -1043,9 +980,10 @@ IOStatus ZonedBlockDevice::GetBestCAZAMatch(Env::WriteLifeTimeHint file_lifetime
       PutOpenIOZoneToken(); //Giving it up 
       return s;
     }
-    // if(allocated_zone != nullptr){
-    //   std::cout << "\t\t\t alreadyOpen get zone id : " << allocated_zone->zone_id_ << std::endl;
-    // }
+    if(allocated_zone != nullptr){
+      // std::cout << "\t\t\t alreadyOpen get zone id : " << allocated_zone->zone_id_ << std::endl;
+      howtoAlloc[6]++; //zenfs기준으로 찾은경우
+    }
   }
 
   *best_diff_out = best_diff;
@@ -1439,7 +1377,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
   unsigned int best_diff = LIFETIME_DIFF_NOT_GOOD;
   int new_zone = 0;
   IOStatus s;
-
+  called_AllocateIOZone++;
 {
   auto tag = ZENFS_WAL_IO_ALLOC_LATENCY;
   if (io_type != IOType::kWAL) {
@@ -1559,6 +1497,37 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, 
       if(!s.ok()) {
         PutOpenIOZoneToken();
         return s;
+      }
+
+      /* If we haven't found an open zone to fill, open a new zone */
+      if(allocated_zone == nullptr) {
+        /* We have to make sure we can open an empty zone */
+        // uint64_t start = env_->NowMicros();
+        while(GetActiveIOZoneTokenIfAvailable() == false) {
+          s = FinishCheapestIOZone();
+          to_finished += 1;
+          if (!s.ok()) {
+            fprintf(stdout, "CAZA Finish Cheapest Zone Failed\n");
+            return s;
+          }
+        }
+
+        s = AllocateEmptyZone(&allocated_zone);
+        if (!s.ok()) {
+          PutActiveIOZoneToken();
+          PutOpenIOZoneToken();
+          return s;
+        }
+
+        if (allocated_zone != nullptr) {
+          assert(allocated_zone->IsBusy());
+          allocated_zone->lifetime_ = file_lifetime;
+          allocated_zone->min_lifetime_ = file_lifetime;
+
+          howtoAlloc[0]++; //caza에 의해 못받아서 early finish하고 새로 empty zone 할당 받은 경우.
+        } else {
+          PutActiveIOZoneToken();
+        }
       }
       
     }

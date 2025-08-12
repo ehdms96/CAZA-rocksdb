@@ -106,8 +106,8 @@ IOStatus ZbdlibBackend::Open(bool readonly, bool exclusive,
   
   block_sz_ = info.pblock_size;
   zone_sz_ = info.zone_size;
-  nr_zones_ = info.nr_zones;
-  //nr_zones_ = 240; // filesystem size
+  //nr_zones_ = info.nr_zones;
+  nr_zones_ = 512; // filesystem size
 
   zbd_report_zones(read_f_, 0, zone_sz_, ZBD_RO_ALL, &z, &report); // jy
   zone_capacity_ = zbd_zone_capacity(&z);

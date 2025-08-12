@@ -276,6 +276,11 @@ ZenFS::~ZenFS() {
     for (int i = 0; i < 4; i++) {
       fprintf(stdout, "Lifetime Diff %d : %ld\n", i, zbd_->diff_cnt_[i].load());
     }
+
+    for (int i = 0; i < 7; i++) {
+      fprintf(stdout, "howtoAlloc %d : %ld\n", i, zbd_->howtoAlloc[i].load());
+    }
+
     fprintf(stdout, "***********************************************************\n");
     fprintf(stdout, "***********************Avg Alloc Time**********************\n");
     fprintf(stdout, "avg alloc time : %lf ms\n", (zbd_->alloc_time_.load() / zbd_->alloc_count_.load()) / 1000.0);
@@ -305,13 +310,47 @@ ZenFS::~ZenFS() {
     std::cout << "[GCFinal Total GC check count #] : " << total_GC_count << "\n";
     std::cout << "[GCFinal Total Victim Zone #] : " << total_vcitimzone_num << "\n";
     fprintf(stdout, "***********************************************************\n");
+
+    fprintf(stdout, "called_AllocateNewZone : %d\n", zbd_->called_AllocateNewZone);
+    fprintf(stdout, "called_AllocateIOZone : %d\n", zbd_->called_AllocateIOZone);
+    fprintf(stdout, "called_FinishCheapestIOZone : %d\n", zbd_->called_FinishCheapestIOZone);
+    fprintf(stdout, "called_ResetUnusedIOZones : %d\n", zbd_->called_ResetUnusedIOZones.load());
+        fprintf(stdout, "finish cnt atomic : %u\n", zbd_->finish_cnt_atomic.load());
+        fprintf(stdout, "finish elapsed atomic : %lu ms\n", zbd_->finish_elapsed_atomic.load() / 1000);
+        fprintf(stdout, "caza Finished : %d \n", zbd_->to_finished);
+        fprintf(stdout, "Reset ETC : %u\n", zbd_->reset_etc.load());
+        fprintf(stdout, "Early Finish : %u\n", zbd_->early_finish_.load()); // early finish
+    fprintf(stdout, "***********************************************************\n");
+
     // ***********************************************************
     fprintf(stdout, "Last Zone Used Num : %ld\n", zbd_->GetLastZoneNum());
     fprintf(stdout, "***********************************************************\n");
     // ***********************************************************
-    fprintf(stdout, "ZoneUtilization\n");
-    zbd_->ZoneUtilization();
+    // fprintf(stdout, "ZoneUtilization\n");
+    // zbd_->ZoneUtilization();
     // ***********************************************************
+    // fprintf(stdout, "***********************************************************\n");
+
+    fprintf(stdout, "ext count : %u\n", ext_count_);
+    fprintf(stdout, "*******************victim zone utils [%ld] **********************\n", victim_zone_utils.size());
+    for (uint32_t i = 0; i < victim_zone_utils.size(); i++) {
+      fprintf(stdout, "%d. %lf\n", i + 1, victim_zone_utils[i]);
+    }
+
+    // zbd_->ZoneUtilization();
+    fprintf(stdout, "*******************gc zone utils --> no.reclaim [%ld] **********************\n", gc_zone_utils.size());
+    for (uint32_t i = 0; i < gc_zone_utils.size(); i++) {
+      fprintf(stdout, "%d. free : %lu copied data : %u\n", i + 1, gc_zone_utils[i].first, gc_zone_utils[i].second);
+    }
+
+    fprintf(stdout, "******************victim zone counts [%ld] ********************\n", victim_zone_cnts.size());
+    for (uint32_t i = 0; i < victim_zone_cnts.size(); i++) {
+      fprintf(stdout, "%d. %u\n", i + 1, victim_zone_cnts[i]);
+    }
+    fprintf(stdout, "****************free percents [%ld] **********************\n", free_percents.size());
+    for (uint32_t i = 0; i < free_percents.size(); i++) {
+      fprintf(stdout, "%d. %lu\n", i + 1, free_percents[i]);
+    }
 
     meta_log_.reset(nullptr);
     ClearFiles();
@@ -357,123 +396,9 @@ std::string time_in_HH_MM_SS_MMM_l()
     return oss.str();
 }
 
-void ZenFS::DZAWorker() { // Dynamic Zone Allocator insted of GC
-
-  uint64_t total_blocking_time = 0;
-  
-  uint64_t medium_blocking_time = 0;
-  uint64_t long_blocking_time = 0;
-  uint64_t extreme_blocking_time = 0;
-
-  double medium_blocking_ratio = 0.0;
-  double long_blocking_ratio = 0.0;
-  double extreme_blocking_ratio = 0.0;
-
-  uint64_t ocp_zone_num_medium = 0;
-  uint64_t ocp_zone_num_long = 0;
-  uint64_t ocp_zone_num_extreme = 0;
-
-  int64_t req_zone_num_medium = 0;
-  int64_t req_zone_num_long = 0;
-  int64_t req_zone_num_extreme = 0;
-
-  uint64_t zone_num_total = zbd_->GetMaxIOZones();
-
-  while (run_DZA_worker_) {
-    usleep(1000 * 1000 * 1);
-
-    medium_blocking_time = zbd_->GetBlockingTime(3);
-    long_blocking_time = zbd_->GetBlockingTime(4);
-    extreme_blocking_time = zbd_->GetBlockingTime(5);
-
-    if (!(medium_blocking_time && long_blocking_time && extreme_blocking_time))
-      continue;
-    
-    total_blocking_time = medium_blocking_time + long_blocking_time + extreme_blocking_time;
-
-    medium_blocking_ratio = (double)medium_blocking_time / (double)total_blocking_time;
-    long_blocking_ratio = (double)long_blocking_time / (double)total_blocking_time;
-    extreme_blocking_ratio = (double)extreme_blocking_time / (double)total_blocking_time;
-
-    //req_zone_num_medium = medium_blocking_ratio;
-    ocp_zone_num_medium = zbd_->GetOccupiedZoneNum(3);
-    ocp_zone_num_long = zbd_->GetOccupiedZoneNum(4);
-    ocp_zone_num_extreme = zbd_->GetOccupiedZoneNum(5);
-
-    uint64_t remain_zones = zone_num_total;
-
-    req_zone_num_medium = req_zone_num_long = req_zone_num_extreme = 1;
-    remain_zones -=3;
-
-    req_zone_num_medium += (medium_blocking_ratio * remain_zones); 
-    req_zone_num_long += (long_blocking_ratio * remain_zones); 
-    req_zone_num_extreme += (extreme_blocking_ratio * remain_zones); 
-
-    remain_zones = zone_num_total - req_zone_num_medium - req_zone_num_long - req_zone_num_extreme;
-
-
-    double temp_br_medium = medium_blocking_ratio - (int)medium_blocking_ratio;
-    double temp_br_long = long_blocking_ratio - (int)long_blocking_ratio;
-    double temp_br_extreme = extreme_blocking_ratio - (int)extreme_blocking_ratio;    
-
-
-    for (uint64_t i=1;i<=remain_zones;i++) {
-      double max_ratio = std::max({temp_br_medium, temp_br_long, temp_br_extreme});
-      if (max_ratio == temp_br_medium && max_ratio != 0) {
-        req_zone_num_medium++;
-        temp_br_medium = 0;
-        continue;
-      } else if (max_ratio == temp_br_long && max_ratio != 0) {
-        req_zone_num_long++;
-        temp_br_long = 0;
-        continue;
-      } else if (max_ratio == temp_br_extreme && max_ratio != 0) {
-        req_zone_num_extreme++;
-        temp_br_extreme = 0;
-        continue;
-      }
-    }
-
-    req_zone_num_medium = req_zone_num_medium - ocp_zone_num_medium;
-    req_zone_num_long = req_zone_num_long - ocp_zone_num_long;
-    req_zone_num_extreme = req_zone_num_extreme - ocp_zone_num_extreme;
-
-    // first return zones each level
-    
-    if (req_zone_num_medium < 0) {
-      zbd_->AdjustIOZones(3, req_zone_num_medium);
-    } 
-    if (req_zone_num_long < 0) {
-      zbd_->AdjustIOZones(4, req_zone_num_long);
-    }
-    if (req_zone_num_extreme < 0) {
-      zbd_->AdjustIOZones(5, req_zone_num_extreme);
-    }
-
-    if (req_zone_num_medium > 0) {
-      zbd_->AdjustIOZones(3, req_zone_num_medium);
-    } 
-    if (req_zone_num_long > 0) {
-      zbd_->AdjustIOZones(4, req_zone_num_long);
-    }
-    if (req_zone_num_extreme > 0) {
-      zbd_->AdjustIOZones(5, req_zone_num_extreme);
-    }
-
-
-    std::cout << "[Blocking Stats] total zone :" << zone_num_total << ", " \
-    << medium_blocking_ratio << "(" << ocp_zone_num_medium << "," << req_zone_num_medium << "," << zbd_->GetOccupiedZoneNum(3)  << ")," \
-    << long_blocking_ratio << "(" << ocp_zone_num_long << "," << req_zone_num_long << "," << zbd_->GetOccupiedZoneNum(4)  << ")," \
-    << extreme_blocking_ratio << "(" << ocp_zone_num_extreme << "," << req_zone_num_extreme << "," << zbd_->GetOccupiedZoneNum(5)  << ")\n";
-    
-  }
-}
-
-
 void ZenFS::GCWorker() {
   while (run_gc_worker_) {
-    usleep(1000 * 1000 * 10); // original = 10s
-
+    usleep(1000 * 100 * 5); // original = 10s
     uint64_t non_free = zbd_->GetUsedSpace() + zbd_->GetReclaimableSpace();
     uint64_t free = zbd_->GetFreeSpace();
     uint64_t free_percent = (100 * free) / (free + non_free);
@@ -484,15 +409,16 @@ void ZenFS::GCWorker() {
     double elapsed_time = 0;
 
     if (free_percent > GC_START_LEVEL) continue;
-    total_GC_count++;
     // std::cout << "free_percent : " << free_percent << " GC_start_level : " << GC_START_LEVEL << " " << std::endl;
 
     auto gc_start = std::chrono::steady_clock::now();
 
     std::unique_lock<std::mutex> lock(zbd_->gc_zone_mtx_);
     zbd_->gc_resource_.wait(lock, [this] { return !zbd_->zone_gc_doing; });
+
     zbd_->zone_gc_doing = true;
     
+    total_GC_count++;
     options.zone_ = 1;
     options.zone_file_ = 1;
     options.log_garbage_ = 1;
@@ -501,6 +427,7 @@ void ZenFS::GCWorker() {
 
     uint64_t threshold = (100 - GC_SLOPE * (GC_START_LEVEL - free_percent));
     std::set<uint64_t> migrate_zones_start;
+    uint32_t victim_zone_cnt = 0;
     
     // fprintf(stdout, "migrate_zones_start : ");
     for (const auto& zone : snapshot.zones_) {
@@ -513,13 +440,21 @@ void ZenFS::GCWorker() {
         if (garbage_percent_approx > threshold && garbage_percent_approx < 100) {
           migrate_zones_start.emplace(zone.start); 
           // fprintf(stdout, "<%ld>", zone.start/2147483648);
+
+          double vutil = (double)zone.used_capacity / zone.max_capacity;
+          victim_zone_utils.push_back(vutil);
+          // zone_copied_data.insert(std::make_pair<uint64_t, uint32_t>(zone.start, zone.used_capacity));
+          victim_zone_cnt++;
         }
       }
     }
+
+    free_percents.push_back(free_percent);
+    victim_zone_cnts.push_back(victim_zone_cnt);
     // std::cout << std::endl;
     total_vcitimzone_num += migrate_zones_start.size();
-    fprintf(stdout, "threshold : %ld, free_percent : %ld, garbage victim zone # : %ld\n",
-            threshold, free_percent, migrate_zones_start.size());
+    // fprintf(stdout, "threshold : %ld, free_percent : %ld, garbage victim zone # : %ld\n", threshold, free_percent, migrate_zones_start.size());
+    
     // if(migrate_zones_start.size() != 0){
     //   for(auto iter = migrate_zones_start.begin() ; iter != migrate_zones_start.end(); iter++){
     //     Zone* Logzone = zbd_->id_to_zone_.find((*iter)/2147483648)->second;
@@ -537,7 +472,7 @@ void ZenFS::GCWorker() {
       }
     }
     // std::cout << std::endl;
-
+    std::unordered_map<uint64_t, uint32_t> zone_copied_data; // key : zone start lba, value : copied data
     if (migrate_exts.size() > 0) {
       
       for (auto& ext : migrate_exts) {
@@ -546,11 +481,18 @@ void ZenFS::GCWorker() {
 
       IOStatus s;
       Info(logger_, "Garbage collecting %d extents \n", (int)migrate_exts.size());
-      s = MigrateExtents(migrate_exts);
+      s = MigrateExtents(migrate_exts, zone_copied_data);
       if (!s.ok()) {
         Error(logger_, "Garbage collection failed");
       }
     }
+
+    for (const auto &e : zone_copied_data) {
+      if (e.second != 0) {
+        gc_zone_utils.push_back(std::make_pair(free_percent, e.second));
+      }
+    }
+
     total_copied_data_size2+= copied_data_size;
     auto gc_end = std::chrono::steady_clock::now();
     elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(gc_end-gc_start).count();
@@ -839,14 +781,19 @@ IOStatus ZenFS::SyncFileExtents(ZoneFile* zoneFile,
     return s;
   }
   // std::cout << "s is ok." << std::endl;
-  
   // Clear changed extents' zone stats
   for (size_t i = 0; i < new_extents.size(); ++i) {
-    ZoneExtent* old_ext = old_extents[i];
-    if (old_ext->start_ != new_extents[i]->start_) {
-      old_ext->zone_->used_capacity_ -= old_ext->length_;
+    //std::cout << old_extents[i] << " new_extets.size () : " << new_extents.size() << " now i : " << i << std::endl;
+    if(i < old_extents.size()){
+      ZoneExtent* old_ext = old_extents[i];
+
+      if(old_ext != nullptr){
+        if (old_ext->start_ != new_extents[i]->start_) {
+          old_ext->zone_->used_capacity_ -= old_ext->length_;
+        }
+        delete old_ext;
+      }
     }
-    delete old_ext;
   }
 
   // std::cout << "**********************old_change_extents info**********************" << std::endl;
@@ -1848,9 +1795,9 @@ Status ZenFS::Mount(bool readonly) {
       gc_worker_.reset(new std::thread(&ZenFS::GCWorker, this));
     }
 
-    if (true) { // please change this code like upper GC
-      DZA_worker_.reset(new std::thread(&ZenFS::DZAWorker, this));
-    }
+    // if (true) { // please change this code like upper GC
+    //   DZA_worker_.reset(new std::thread(&ZenFS::DZAWorker, this));
+    // }
 
   }
 
@@ -2111,7 +2058,7 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
 }
 
 IOStatus ZenFS::MigrateExtents(
-    const std::vector<ZoneExtentSnapshot*>& extents) {
+    const std::vector<ZoneExtentSnapshot*>& extents, std::unordered_map<uint64_t, uint32_t>& zone_copied_data) {
   IOStatus s;
   // Group extents by their filename
   std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
@@ -2124,7 +2071,7 @@ IOStatus ZenFS::MigrateExtents(
   }
 
   for (const auto& it : file_extents) {
-    s = MigrateFileExtents(it.first, it.second);
+    s = MigrateFileExtents(it.first, it.second, zone_copied_data);
     if (!s.ok()) break;
     s = zbd_->ResetUnusedIOZones();
     if (!s.ok()) break;
@@ -2134,7 +2081,7 @@ IOStatus ZenFS::MigrateExtents(
 
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
-    const std::vector<ZoneExtentSnapshot*>& migrate_exts) {
+    const std::vector<ZoneExtentSnapshot*>& migrate_exts, std::unordered_map<uint64_t, uint32_t>& zone_copied_data) {
 
   IOStatus s = IOStatus::OK();
   Zone* test_zone = nullptr;
@@ -2211,6 +2158,14 @@ IOStatus ZenFS::MigrateFileExtents(
       zfile->MigrateData(ext->start_, ext->length_, target_zone);
       zbd_->AddGCBytesWritten(ext->length_);
     }
+
+    std::unordered_map<uint64_t, uint32_t>::iterator iter = zone_copied_data.find(ext->zone_->start_);
+    if (iter != zone_copied_data.end()) {
+      iter->second = iter->second + ext->length_;
+    } else {
+      zone_copied_data.insert(std::make_pair(ext->zone_->start_, ext->length_));
+    }
+    ext_count_++;
 
     // If the file doesn't exist, skip
     if (GetFileNoLock(fname) == nullptr) {
