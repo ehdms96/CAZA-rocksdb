@@ -11,13 +11,7 @@ fi
 
 if [ ! $2 ] 
 then
-	echo "$2 thread num (1/ 2/ 4/ 8/ 12/ 16)"
-	exit 1 
-fi
-
-if [ ! $3 ] 
-then
-	echo "$3 input num"
+	echo "$0 Thread num (2 or 4 or 8)"
 	exit 1 
 fi
 
@@ -29,11 +23,7 @@ echo "Init filesystem (CAZA)"
 rm -r /data2/doeun/zns_zenfs_aux01/
 blkzone reset /dev/nvme3n2
 max_bk_jobs=$2
-num=$3
-
-num_record=130000000
-num_op=$(expr $num_record / 128)
-
+num=150000000
 echo "thread $max_bk_jobs !!!!!!!!!!"
 
 ../plugin/zenfs/util/zenfs mkfs --zbd=/nvme3n2 --aux_path=/data2/doeun/zns_zenfs_aux01/ --enable_gc=true --force
@@ -64,17 +54,17 @@ then
 	./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=fillrandom --use_direct_io_for_flush_and_compaction --compression_type=none -cache_size=268435456 -key_size=48 -value_size=43 -num=50000000
 elif [ $1 -eq 5 ] #<-------------------------
 then
-	echo "db_bench 420K 300M FillRandom + Overwrite"
+	echo "420K 300M FillRandom + Overwrite"
 	./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=fillrandom,overwrite,stats --use_direct_io_for_flush_and_compaction \
 		--key_size=20 --value_size=800 --num=$num --max_background_jobs=$max_bk_jobs --disable_wal
 elif [ $1 -eq 6 ]
 then
-	echo "(YCSB A) Load & Workload A 1000"
-	./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=YCSBLOAD,YCSBA,stats --use_direct_io_for_flush_and_compaction \
-				 --compression_type=none --num_record=$num_record --num_op=$num_op --max_background_jobs=$max_bk_jobs --threads=128 --disable_wal
+	echo "GDB 16"
+	gdb --args ./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=fillrandom,overwrite,stats --use_direct_io_for_flush_and_compaction \
+	--key_size=20 --value_size=800 --num=80000000 --max_background_jobs=16 --disable_wal
 elif [ $1 -eq 7 ]
 then
-	echo "(YCSB B) Load & Workload B 1000"
-	./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=YCSBLOAD,YCSBB,stats --use_direct_io_for_flush_and_compaction \
-				 --compression_type=none --num_record=$num_record --num_op=$num_op --max_background_jobs=$max_bk_jobs --threads=128 --disable_wal
+	echo "420K 3M FillRandom + Overwrite"
+	./db_bench --fs_uri=zenfs://dev:nvme3n2 --benchmarks=fillrandom,overwrite,stats --use_direct_io_for_flush_and_compaction \
+		--key_size=20 --value_size=800 --num=$num --max_background_jobs=$max_bk_jobs --disable_wal 1> /data2/doeun/tmpfs/jinyoung/caza_gc_util_v2 2>&1
 fi
